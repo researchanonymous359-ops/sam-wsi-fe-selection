@@ -3,10 +3,9 @@ import inspect
 import random
 from typing import Any, Callable, Optional, Tuple
 
+import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
-import pytorch_lightning as pl
-
 from torchmetrics.classification import (
     MulticlassAccuracy,
     MulticlassCalibrationError,
@@ -18,10 +17,13 @@ from pl_model.optimizers import Lookahead, Lion
 
 class MILGradingTrainerModule(pl.LightningModule):
     """
-    Grading 전용 Trainer (일반 MIL용)
-    - validation monitor: QWK (Quadratic Weighted Kappa)
-    - save_metrics 계열과 호환: y_prob_list/label_list/names/logits/labels 유지
-    - ✅ DTFD grading과 동일한 철학: metric update 전에 항상 slide-level shape 정규화
+    Trainer module dedicated to grading tasks (general MIL models).
+
+    - Validation monitor: QWK (Quadratic Weighted Kappa)
+    - Compatible with save_metrics-style scripts:
+      keeps y_prob_list / label_list / names / logits / labels
+    - Same philosophy as DTFD grading:
+      always normalize logits to slide-level shapes before metric updates
     """
 
     def __init__(
@@ -34,7 +36,7 @@ class MILGradingTrainerModule(pl.LightningModule):
         resolution_str,
         classifier,
         loss_func,
-        metrics=None,               # main.py에서 넘겨줘도 grading에서는 안정성 위해 직접 생성
+        metrics=None,  # even if passed from main.py, grading uses its own metrics for stability
         forward_func: Callable = None,
         attention_func: Optional[Callable] = None,
         patch_path=None,
@@ -64,7 +66,7 @@ class MILGradingTrainerModule(pl.LightningModule):
 
         self.automatic_optimization = True
 
-        # Patch Drop (optional)
+        # Patch drop (optional)
         self.mil_patch_drop_min = float(getattr(self.args, "mil_patch_drop_min", 0.0))
         self.mil_patch_drop_max = float(getattr(self.args, "mil_patch_drop_max", 0.0))
         self._use_patch_drop = self.mil_patch_drop_max > 0.0
@@ -72,7 +74,7 @@ class MILGradingTrainerModule(pl.LightningModule):
         self.use_weighted_sampler = bool(getattr(self.args, "use_weighted_sampler", False))
 
         # -----------------------------
-        # Metrics (Grading 전용)
+        # Metrics (grading-specific)
         # -----------------------------
         self.train_acc = MulticlassAccuracy(num_classes=self.num_classes, average="micro")
 
@@ -83,21 +85,26 @@ class MILGradingTrainerModule(pl.LightningModule):
         self.test_acc = MulticlassAccuracy(num_classes=self.num_classes, average="micro")
         self.test_bacc = MulticlassAccuracy(num_classes=self.num_classes, average="macro")
         self.test_qwk = MulticlassCohenKappa(num_classes=self.num_classes, weights="quadratic")
-        self.test_ece = MulticlassCalibrationError(num_classes=self.num_classes, n_bins=int(getattr(args, "n_bins", 15)))
+        self.test_ece = MulticlassCalibrationError(
+            num_classes=self.num_classes, n_bins=int(getattr(args, "n_bins", 15))
+        )
 
-        # Callback 분석용 버퍼
+        # Buffer for analysis callback
         self.test_outputs = []
 
-        # save_metrics_grading.py 호환용 버퍼
+        # Buffers for save_metrics_grading.py compatibility
         self.y_prob_list = []
         self.label_list = []
         self.names = []
         self.logits = None
         self.labels = None
 
-        # ---- forward_fn signature 호환 처리용 캐시 ----
+        # ---- Cache for forward_fn signature compatibility ----
         self._forward_accepts_args = self._func_accepts_kw(self.forward_func, "args")
-        self._attn_accepts_args = self._func_accepts_kw(self.attention_forward, "args") if self.attention_forward else False
+        self._attn_accepts_args = (
+            self._func_accepts_kw(self.attention_forward, "args") if self.attention_forward else False
+        )
+
         # =========================
         # DEBUG PRINTS (Grading)
         # =========================
@@ -129,35 +136,37 @@ class MILGradingTrainerModule(pl.LightningModule):
             f"gamma={getattr(self.args, 'grading_cost_gamma', None)} "
             f"normalize={bool(getattr(self.args, 'grading_cost_normalize', False))}"
         )
+
     # --------------------------------
-    # helpers
+    # Helpers
     # --------------------------------
     @staticmethod
     def _func_accepts_kw(func: Optional[Callable], kw: str) -> bool:
+        """Return True if func accepts keyword `kw` or supports **kwargs."""
         if func is None:
             return False
         try:
             sig = inspect.signature(func)
             if kw in sig.parameters:
                 return True
-            # **kwargs를 받는지
+            # Check if it accepts **kwargs
             for p in sig.parameters.values():
                 if p.kind == inspect.Parameter.VAR_KEYWORD:
                     return True
             return False
         except Exception:
-            # signature introspection 실패 시 안전하게 False 처리하고 try/except로 커버
+            # If signature introspection fails, safely return False and rely on try/except outside.
             return False
 
     @staticmethod
     def _to_slide_logits(y_logit: torch.Tensor) -> torch.Tensor:
         """
-        metric / argmax / softmax 전에 logits shape 정규화
+        Normalize logits shape before metrics / argmax / softmax:
 
-        - (C,)      -> (1,C)
-        - (1,C)     -> (1,C)
-        - (G,C)     -> (1,C) by mean over G  (혹시 모델이 group logits를 내는 경우 방어)
-        - (1,G,C)   -> (1,C) by mean over G
+        - (C,)      -> (1, C)
+        - (1, C)    -> (1, C)
+        - (G, C)    -> (1, C) by mean over G (defensive for group logits)
+        - (1, G, C) -> (1, C) by mean over G
         """
         if y_logit is None:
             raise ValueError("y_logit is None")
@@ -171,7 +180,7 @@ class MILGradingTrainerModule(pl.LightningModule):
             return y_logit
 
         if y_logit.ndim == 3 and y_logit.size(0) == 1:
-            # (1,G,C)
+            # (1, G, C)
             return y_logit.mean(dim=1)
 
         raise ValueError(f"Unexpected y_logit shape: {tuple(y_logit.shape)}")
@@ -179,9 +188,10 @@ class MILGradingTrainerModule(pl.LightningModule):
     @staticmethod
     def _to_slide_prob(y_prob: torch.Tensor) -> torch.Tensor:
         """
-        - (C,) -> (1,C)
-        - (G,C) -> (1,C) mean
-        - (1,G,C) -> (1,C) mean over G
+        Normalize probability tensor shape:
+        - (C,)      -> (1, C)
+        - (G, C)    -> (1, C) mean over G
+        - (1, G, C) -> (1, C) mean over G
         """
         if y_prob is None:
             return None
@@ -200,10 +210,11 @@ class MILGradingTrainerModule(pl.LightningModule):
         """
         label:
           - hard: (1,) or (B,)
-          - soft: (1,C) or (B,C)
-        returns:
-          label_idx: (B,)  (metric용)
-          target_label: loss용 label (hard/soft 그대로)
+          - soft: (1, C) or (B, C)
+
+        Returns:
+          label_idx: (B,) for metrics
+          target_label: label for loss (keep hard/soft as appropriate)
         """
         target_label = label
         if isinstance(label, torch.Tensor) and label.ndim > 1:
@@ -214,6 +225,7 @@ class MILGradingTrainerModule(pl.LightningModule):
         return label_idx, target_label
 
     def _random_patch_subsample(self, feats: torch.Tensor) -> torch.Tensor:
+        """Randomly subsample patches according to patch-drop settings."""
         if feats.dim() != 2 or feats.size(0) <= 1:
             return feats
 
@@ -239,16 +251,19 @@ class MILGradingTrainerModule(pl.LightningModule):
     # --------------------------------
     def forward(self, feats, label=None):
         """
-        forward_func 지원 형태가 2종일 수 있음:
+        The forward_func may support two signatures:
 
-        (A) grading 전용 형태:
-            y_logit, loss, y_prob = forward_func(feats, classifier, loss_func, num_classes, label=..., args=args)
+        (A) grading-specific:
+            y_logit, loss, y_prob = forward_func(
+                feats, classifier, loss_func, num_classes, label=..., args=args
+            )
 
-        (B) 기존 classification 형태:
-            y_logit, loss, y_prob = forward_func(feats, classifier, loss_func, num_classes, label=...)
-            (args 미지원)
+        (B) legacy classification-style (no args):
+            y_logit, loss, y_prob = forward_func(
+                feats, classifier, loss_func, num_classes, label=...
+            )
 
-        ✅ 둘 다 호환되게 호출한다.
+        This wrapper supports both.
         """
         if self._forward_accepts_args:
             return self.forward_func(
@@ -260,7 +275,7 @@ class MILGradingTrainerModule(pl.LightningModule):
                 args=self.args,
             )
 
-        # fallback: args 없이
+        # Fallback: call without args
         return self.forward_func(
             feats,
             self.classifier,
@@ -270,8 +285,9 @@ class MILGradingTrainerModule(pl.LightningModule):
         )
 
     def get_attention_maps(self, feats, label=None):
+        """Call attention_forward with/without args depending on its signature."""
         if self.attention_forward is None:
-            raise RuntimeError("attention_forward is None, but get_attention_maps() called.")
+            raise RuntimeError("attention_forward is None, but get_attention_maps() was called.")
 
         if self._attn_accepts_args:
             return self.attention_forward(
@@ -292,7 +308,7 @@ class MILGradingTrainerModule(pl.LightningModule):
         )
 
     # --------------------------------
-    # training / validation / test
+    # Training / validation / test
     # --------------------------------
     def training_step(self, batch, batch_idx):
         name, coords, feats, label = batch
@@ -346,11 +362,11 @@ class MILGradingTrainerModule(pl.LightningModule):
             f"QWK: {val_qwk:.4f} | ACC: {val_acc:.2f}% | Balanced ACC: {val_bacc:.2f}%"
         )
 
-        # ✅ main.py EarlyStopping/Checkpoint 모니터용
+        # For main.py EarlyStopping/Checkpoint monitors
         self.log("QWK/val", val_qwk, sync_dist=False)
         self.log("val_qwk", val_qwk, prog_bar=True, sync_dist=False)
 
-        # 참고용
+        # Reference logs
         self.log("ACC/val", val_acc, sync_dist=False)
         self.log("ACC_balanced/val", val_bacc, sync_dist=False)
         self.log("val_bacc", val_bacc, prog_bar=True, sync_dist=False)
@@ -391,16 +407,16 @@ class MILGradingTrainerModule(pl.LightningModule):
         else:
             y_logit, loss, y_prob = self.forward(feats, label=target_label)
 
-        # ✅ logits/ probs를 slide-level로 통일
+        # Normalize logits/probs to slide-level
         y_logit = self._to_slide_logits(y_logit)
 
-        # y_prob이 없거나 shape 이상하면 softmax로 대체
+        # If y_prob is missing or malformed, fallback to softmax(logits)
         if not isinstance(y_prob, torch.Tensor):
             y_prob = torch.softmax(y_logit.detach(), dim=1)
         else:
             y_prob = self._to_slide_prob(y_prob)
             if y_prob.ndim != 2 or y_prob.size(0) != 1:
-                # 최후 방어
+                # Final defensive fallback
                 y_prob = torch.softmax(y_logit.detach(), dim=1)
 
         self.test_acc.update(y_logit.detach(), label_idx)
@@ -419,9 +435,11 @@ class MILGradingTrainerModule(pl.LightningModule):
             {
                 "name": slide_name,
                 "coords": coords,
-                "probs": y_prob.detach().cpu(),           # (1,C)
-                "label": label_idx.detach().cpu(),        # (1,)
-                "attn": attn_map.detach().cpu() if (attn_map is not None and hasattr(attn_map, "detach")) else None,
+                "probs": y_prob.detach().cpu(),  # (1, C)
+                "label": label_idx.detach().cpu(),  # (1,)
+                "attn": attn_map.detach().cpu()
+                if (attn_map is not None and hasattr(attn_map, "detach"))
+                else None,
             }
         )
 
@@ -450,7 +468,7 @@ class MILGradingTrainerModule(pl.LightningModule):
         self.test_qwk.reset()
         self.test_ece.reset()
 
-        # save_metrics 호환용 속성
+        # Attributes for save_metrics compatibility
         self.logits = torch.cat(self.y_prob_list, dim=0).detach().cpu() if len(self.y_prob_list) else None
         self.labels = torch.cat(self.label_list, dim=0).detach().cpu() if len(self.label_list) else None
 

@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-# [수정] network.py에서 Classifier_1fc 가져오기
+# [Modified] Import Classifier_1fc from network.py
 from model.dtfdmil.network import Classifier_1fc
 
 class Attention_Gated(nn.Module):
@@ -44,7 +44,7 @@ class Attention_with_Classifier(nn.Module):
         self.num_cls = num_cls
 
         self.attention = Attention_Gated(L, D, K)
-        # 텍스트/서브사이트 로직 제거 -> 입력 차원 L 그대로 사용
+        # Removed text/subsite logic -> Use input dimension L as is
         self.classifier = Classifier_1fc(L * K, num_cls, droprate)
     
     def forward(self, x): 
@@ -57,5 +57,5 @@ class Attention_with_Classifier(nn.Module):
         # Classification
         pred = self.classifier(afeat) # K x num_cls
         
-        # 🔥 [핵심 수정] pred와 AA를 같이 반환해야 DTFD 로직이 동작함
+        # 🔥 [Core Modification] Must return both pred and AA for DTFD logic to work
         return pred, AA

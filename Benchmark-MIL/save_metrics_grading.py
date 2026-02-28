@@ -15,21 +15,21 @@ import seaborn as sns
 
 
 # ----------------------------
-# 전역 상태
+# Global state
 # ----------------------------
 metrics_dict = dict()
 perclass_dict = dict()
 all_seed_logits_dict = dict()
 all_seed_labels_dict = dict()
 
-# 요약 테이블 컬럼 순서(원하는 순서대로)
+# Column order for the summary table (in the desired order)
 metric_list_qwk = ["QWK", "Balanced Accuracy"]
 metric_list_acc = ["Balanced Accuracy", "QWK"]
 
 
 def _to_numpy_probs_and_labels(y_prob: torch.Tensor, y_true: torch.Tensor):
     """
-    y_prob: [N,C] (prob or logits)
+    y_prob: [N, C] (probabilities or logits)
     y_true: [N]
     """
     if y_prob.ndim == 3 and y_prob.size(1) == 1:
@@ -44,7 +44,7 @@ def _to_numpy_probs_and_labels(y_prob: torch.Tensor, y_true: torch.Tensor):
 
 def _safe_qwk(y_true_np, y_pred_np):
     """
-    sklearn cohen_kappa_score는 한 클래스만 존재하면 경고/NaN 나올 수 있음.
+    sklearn's cohen_kappa_score can warn/return NaN when only one class exists.
     """
     try:
         if len(np.unique(y_true_np)) < 2 and len(np.unique(y_pred_np)) < 2:
@@ -64,7 +64,7 @@ def initialize_grading_metrics(test_dataset_info):
 
 def make_single_result_grading_metrics(args, seed, trainer_model, test_results, test_dataset_element_name, num_classes):
     """
-    seed별 single 결과 저장:
+    Save per-seed single results:
       - QWK (quadratic weighted kappa)
       - Balanced Accuracy (macro)
     """
@@ -76,7 +76,7 @@ def make_single_result_grading_metrics(args, seed, trainer_model, test_results, 
             print(f"[ERROR] label_list is empty for seed={seed}, dataset={test_dataset_element_name}")
             return
 
-        y_prob = torch.cat(trainer_model.y_prob_list, dim=0)  # [N,C] (prob)
+        y_prob = torch.cat(trainer_model.y_prob_list, dim=0)  # [N, C] (prob)
         y_true = torch.cat(trainer_model.label_list, dim=0)   # [N]
         y_prob, y_true = _to_numpy_probs_and_labels(y_prob, y_true)
 
@@ -88,12 +88,12 @@ def make_single_result_grading_metrics(args, seed, trainer_model, test_results, 
         qwk = _safe_qwk(y_true.numpy(), y_pred.numpy())
         qwk = round(qwk * 100.0, 3)
 
-        # 저장 (QWK + Balanced Accuracy)
+        # Store (QWK + Balanced Accuracy)
         metrics_dict[test_dataset_element_name]["Seed"].extend([int(seed)] * len(metric_list_qwk))
         metrics_dict[test_dataset_element_name]["Metric"].extend(metric_list_qwk)
         metrics_dict[test_dataset_element_name]["Result"].extend([qwk, bal_acc])
 
-        # per-class accuracy 저장
+        # Store per-class accuracy
         class_names = getattr(trainer_model, "test_class_names_list", [str(i) for i in range(num_classes)])
         perclass_dict[test_dataset_element_name]["Method"].append(int(seed))
         perclass_dict[test_dataset_element_name]["Metric"].append("Per-class Accuracy")
@@ -118,12 +118,12 @@ def make_whole_result_grading_metrics(
     num_classes,
     class_names_list,
     save_dir,
-    mean_logits,      # mean_probs(prob)로 들어옴
+    mean_logits,      # passed in as mean_probs (probabilities)
     final_labels,
     slide_names,
 ):
     """
-    ✅ 최종 저장 포맷(요구사항 반영)
+    ✅ Final output format (reflecting requirements)
     - final_results_summary.csv:
         Seed, Balanced Accuracy, QWK
         20, ...
@@ -132,12 +132,12 @@ def make_whole_result_grading_metrics(
         Ensemble, ...
     - final_results_per_class_acc.csv:
         Seed + (class_names)
-    - ensemble_all_predictions / ensemble_wrong_predictions
+    - ensemble_all_predictions.csv / ensemble_wrong_predictions.csv
     - final_confusion_matrix_combined.jpg
     """
     try:
         # ----------------------------
-        # save_dir resolve
+        # Resolve save_dir
         # ----------------------------
         if getattr(args, "base_save_dir", None) is not None:
             base_dir = Path(args.base_save_dir)
@@ -147,14 +147,14 @@ def make_whole_result_grading_metrics(
         save_dir.mkdir(parents=True, exist_ok=True)
 
         # ----------------------------
-        # 1) Average(mean ± std) 추가 (Average_std 행 제거!)
+        # 1) Append Average (mean ± std) (remove separate Average_std row)
         # ----------------------------
         metrics_df = pd.DataFrame(metrics_dict[test_dataset_element_name])  # Seed, Metric, Result
 
         def _append_average_pm(metric_name: str):
             sub = metrics_df[metrics_df["Metric"] == metric_name].copy()
 
-            # seed가 숫자인 것만 대상으로 mean/std 계산 (Average/Ensemble 등 제외)
+            # Compute mean/std only from numeric seeds (exclude Average/Ensemble/etc.)
             sub["Seed_num"] = pd.to_numeric(sub["Seed"], errors="coerce")
             sub = sub.dropna(subset=["Seed_num"])
 
@@ -163,7 +163,7 @@ def make_whole_result_grading_metrics(
                 return
 
             mean_val = float(vals.mean())
-            std_val = float(vals.std())  # pandas 기본(ddof=1) -> 기존 느낌(±) 유지
+            std_val = float(vals.std())  # pandas default ddof=1 -> keeps the usual "±" feel
             pm_str = f"{mean_val:.3f} ± {std_val:.3f}"
 
             metrics_dict[test_dataset_element_name]["Seed"].append("Average")
@@ -174,9 +174,9 @@ def make_whole_result_grading_metrics(
             _append_average_pm(m)
 
         # ----------------------------
-        # 2) Ensemble metric 계산 후 추가
+        # 2) Compute and append ensemble metrics
         # ----------------------------
-        probs = mean_logits.detach().cpu()          # [N,C] prob
+        probs = mean_logits.detach().cpu()          # [N, C] probabilities
         y_true = final_labels.detach().cpu().long() # [N]
         y_pred = torch.argmax(probs, dim=1)
 
@@ -190,16 +190,16 @@ def make_whole_result_grading_metrics(
         metrics_dict[test_dataset_element_name]["Metric"].extend(["QWK", "Balanced Accuracy"])
         metrics_dict[test_dataset_element_name]["Result"].extend([qwk, bal_acc])
 
-        # 최신 metrics_df 갱신
+        # Refresh metrics_df after appending
         metrics_df = pd.DataFrame(metrics_dict[test_dataset_element_name])
 
         # ----------------------------
-        # 3) summary를 "깔끔 pivot"으로 저장
-        #    (Average가 문자열이므로 pivot_table보다 pivot이 안전)
+        # 3) Save a clean pivot summary
+        #    (pivot is safer than pivot_table because Average is a string)
         # ----------------------------
         summary_df = metrics_df.pivot(index="Seed", columns="Metric", values="Result").reset_index()
 
-        # Seed 정렬: 숫자 seed -> Average -> Ensemble
+        # Seed order: numeric seeds -> Average -> Ensemble
         def _seed_sort_key(x):
             try:
                 return (0, int(str(x)))
@@ -213,7 +213,7 @@ def make_whole_result_grading_metrics(
 
         summary_df = summary_df.sort_values(by="Seed", key=lambda s: s.map(_seed_sort_key))
 
-        # 컬럼 순서 고정: Seed, Balanced Accuracy, QWK
+        # Fix column order: Seed, Balanced Accuracy, QWK
         col_order = ["Seed"]
         for c in ["Balanced Accuracy", "QWK"]:
             if c in summary_df.columns:
@@ -226,7 +226,7 @@ def make_whole_result_grading_metrics(
         summary_df.to_csv(save_dir / "final_results_summary.csv", index=False)
 
         # ----------------------------
-        # 4) per-class accuracy도 따로 저장 (seed별 1행)
+        # 4) Save per-class accuracy separately (one row per seed)
         # ----------------------------
         per_df = pd.DataFrame(perclass_dict[test_dataset_element_name]) if len(perclass_dict[test_dataset_element_name]) > 0 else pd.DataFrame()
         if not per_df.empty:
@@ -234,7 +234,7 @@ def make_whole_result_grading_metrics(
             per_df = per_df.drop(columns=["Metric"], errors="ignore")
             per_df = per_df.rename(columns={"Method": "Seed"})
 
-            # Seed 정렬
+            # Sort by seed
             per_df["Seed"] = per_df["Seed"].astype(int)
             per_df = per_df.sort_values("Seed")
 
@@ -243,7 +243,7 @@ def make_whole_result_grading_metrics(
             per_df.to_csv(save_dir / "final_results_per_class_acc.csv", index=False)
 
         # ----------------------------
-        # 5) ensemble prediction csv
+        # 5) Save ensemble prediction CSVs
         # ----------------------------
         rows = []
         for slide_name, pred, gt, p in zip(slide_names, y_pred, y_true, probs):
@@ -266,22 +266,30 @@ def make_whole_result_grading_metrics(
         pred_df[pred_df["GT_idx"] != pred_df["Pred_idx"]].to_csv(save_dir / "ensemble_wrong_predictions.csv", index=False)
 
         # ----------------------------
-        # 6) confusion matrix (count + %)
+        # 6) Confusion matrix (count + %)
         # ----------------------------
         cm = confusion_matrix(y_true.numpy(), y_pred.numpy(), labels=list(range(num_classes)))
         cm_percent = (cm / np.clip(cm.sum(axis=1, keepdims=True), 1e-12, None)) * 100.0
 
         plt.figure(figsize=(10, 7))
         ax = sns.heatmap(
-            cm, annot=False, fmt="d", cmap="Blues",
-            xticklabels=class_names_list, yticklabels=class_names_list
+            cm,
+            annot=False,
+            fmt="d",
+            cmap="Blues",
+            xticklabels=class_names_list,
+            yticklabels=class_names_list,
         )
         for i in range(cm.shape[0]):
             for j in range(cm.shape[1]):
                 ax.text(
-                    j + 0.5, i + 0.5,
+                    j + 0.5,
+                    i + 0.5,
                     f"{cm[i, j]}\n{cm_percent[i, j]:.2f}%",
-                    ha="center", va="center", fontsize=10, color="black"
+                    ha="center",
+                    va="center",
+                    fontsize=10,
+                    color="black",
                 )
         plt.xlabel("Predicted")
         plt.ylabel("True")

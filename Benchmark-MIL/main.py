@@ -1,6 +1,8 @@
 # main.py
 import argparse
 from pathlib import Path
+import warnings
+
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import CSVLogger
@@ -18,14 +20,11 @@ from utils import seed_everything, get_loss_weight
 from dataset import get_class_names
 from model import get_model_module
 
-# classification / grading datamodule (same)
+# Classification / grading datamodule (shared)
 from dataset.classification_grading_dataset import CombinedPatchFeaturesWSIDataModule
-# survival datamodule
-from dataset.survival_analysis_dataset import SurvivalWSIDataModule
 
-# callbacks
+# Callbacks
 from callbacks.analysis_callback import SaveAnalysisResultsCallback
-from callbacks.analysis_callback_survival import SaveSurvivalAnalysisResultsCallback
 from callbacks.analysis_callback_grading import SaveGradingAnalysisResultsCallback
 
 from save_metrics import (
@@ -33,18 +32,12 @@ from save_metrics import (
     make_single_result_metrics,
     make_whole_result_metrics,
 )
-from save_metrics_survival import (
-    initialize_survival_metrics,
-    make_single_result_survival_metrics,
-    make_whole_result_survival_metrics,
-)
 from save_metrics_grading import (
     initialize_grading_metrics,
     make_single_result_grading_metrics,
     make_whole_result_grading_metrics,
 )
 
-import warnings
 warnings.filterwarnings("ignore")
 
 
@@ -79,9 +72,6 @@ def make_experiment_base_dir(args):
         args.feature_extractor,
         args.train_mode,
     ]
-    if args.train_mode == "survival":
-        parts.append(str(args.survival_endpoint))
-        parts.append(f"bins_{int(args.survival_num_bins)}")
 
     base_dir = Path(*parts)
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -91,28 +81,22 @@ def make_experiment_base_dir(args):
 
 def get_monitor_cfg(args):
     # -------------------------
-    # ✅ grading: 무조건 QWK로 monitor
+    # ✅ Grading: always monitor QWK
     # -------------------------
     if args.train_mode == "grading":
-        # ✅ EarlyStopping / ModelCheckpoint 둘 다 이 metric이 "반드시" 로그로 존재해야 함
-        # trainer가 "QWK/val" + "val_qwk" 둘 다 로깅하도록 grading trainer에서 보장한다(아래 파일 참고)
+        # Both EarlyStopping / ModelCheckpoint require this metric to be logged.
+        # The grading trainer guarantees logging both "QWK/val" and "val_qwk".
         return "QWK/val", "max", "best-{epoch:02d}-{val_qwk:.4f}"
 
     # -------------------------
-    # classification
+    # Classification
     # -------------------------
     if args.train_mode == "classification":
         if getattr(args, "use_weighted_sampler", False):
             return "ACC_balanced/val", "max", "best-{epoch:02d}-{val_bacc:.2f}"
         return "Loss/val", "min", "best-{epoch:02d}-{val_loss:.4f}"
 
-    # -------------------------
-    # survival
-    # -------------------------
-    monitor = getattr(args, "monitor_survival_metric", "cindex").lower()
-    if monitor == "cindex":
-        return "CIndex/val", "max", "best-{epoch:02d}-{val_cindex:.4f}"
-    return "Loss/val", "min", "best-{epoch:02d}-{val_loss:.4f}"
+    raise NotImplementedError(f"Unknown train_mode: {args.train_mode}")
 
 
 def _ensure_list(x):
@@ -132,14 +116,8 @@ def _ensure_default_args(args):
     elif isinstance(args.gpu_id, int):
         args.gpu_id = [args.gpu_id]
 
+    # task alias
     args.task = args.train_mode
-
-    if args.train_mode == "survival":
-        if not hasattr(args, "survival_num_bins"):
-            if hasattr(args, "survival_n_bins"):
-                args.survival_num_bins = getattr(args, "survival_n_bins")
-            else:
-                args.survival_num_bins = 20
 
     if not hasattr(args, "accumulate_grad_batches"):
         args.accumulate_grad_batches = 1
@@ -156,7 +134,8 @@ def _print_grading_cfg(args):
         f"grading_alpha={getattr(args, 'grading_alpha', None)} | "
         f"grading_power={getattr(args, 'grading_power', None)} | "
         f"(src) cost_type={getattr(args, 'grading_cost_type', None)} "
-        f"lambda={getattr(args, 'grading_cost_lambda', None)} gamma={getattr(args, 'grading_cost_gamma', None)} "
+        f"lambda={getattr(args, 'grading_cost_lambda', None)} "
+        f"gamma={getattr(args, 'grading_cost_gamma', None)} "
         f"normalize={bool(getattr(args, 'grading_cost_normalize', False))}"
     )
 
@@ -168,7 +147,7 @@ def main(args):
     _print_grading_cfg(args)
 
     # ------------------------------
-    # 0) 공통 경로 / patch_path
+    # 0) Common paths / patch_path
     # ------------------------------
     exp_base_dir = make_experiment_base_dir(args)
     args.base_save_dir = str(exp_base_dir)
@@ -183,19 +162,13 @@ def main(args):
     args.patch_path = f"{args.dataset_root}/{base_dataset_for_patch}/{args.patch_path}"
 
     # ------------------------------
-    # 1) test_dataset_info + metrics init (mode별)
+    # 1) test_dataset_info + metrics init (per mode)
     # ------------------------------
     test_dataset_info = {}
-    survival_K = int(getattr(args, "survival_num_bins", 0)) if args.train_mode == "survival" else None
 
     for tde in args.test_dataset_name:
-        if args.train_mode in {"classification", "grading"}:
-            names = get_class_names(tde)
-            num_classes = len(names)
-        else:
-            names = [f"bin_{i}" for i in range(survival_K)]
-            num_classes = survival_K
-
+        names = get_class_names(tde)
+        num_classes = len(names)
         test_dataset_info[tde] = {
             "test_class_names_list": names,
             "test_num_classes": num_classes,
@@ -204,116 +177,63 @@ def main(args):
 
     if args.train_mode == "classification":
         initialize_metrics(test_dataset_info)
-        all_seed_logits_dict = {k: [] for k in test_dataset_info}
-        all_seed_labels_dict = {k: [] for k in test_dataset_info}
-        all_seed_names_dict = {k: [] for k in test_dataset_info}
-
     elif args.train_mode == "grading":
         initialize_grading_metrics(test_dataset_info)
-        all_seed_logits_dict = {k: [] for k in test_dataset_info}
-        all_seed_labels_dict = {k: [] for k in test_dataset_info}
-        all_seed_names_dict = {k: [] for k in test_dataset_info}
-
     else:
-        initialize_survival_metrics(test_dataset_info)
-        all_seed_logits_dict = None
-        all_seed_labels_dict = None
-        all_seed_names_dict = None
+        raise NotImplementedError(f"Unknown train_mode: {args.train_mode}")
+
+    all_seed_logits_dict = {k: [] for k in test_dataset_info}
+    all_seed_labels_dict = {k: [] for k in test_dataset_info}
+    all_seed_names_dict = {k: [] for k in test_dataset_info}
 
     # ------------------------------
-    # 2) seed loop
+    # 2) Seed loop
     # ------------------------------
     for seed in args.seed:
         seed_everything(seed)
         args.resolution_str = "_".join(args.resolution_list)
 
         # --------------------------------------
-        # Train DataModule (mode별)
+        # Train DataModule
         # --------------------------------------
-        if args.train_mode == "survival":
-            train_ds_name = (
-                args.train_dataset_name[0]
-                if isinstance(args.train_dataset_name, list)
-                else args.train_dataset_name
-            )
+        train_dm = CombinedPatchFeaturesWSIDataModule(
+            dataset_root=args.dataset_root,
+            dataset_mode="train",
+            train_dataset_name=args.train_dataset_name,
+            resolutions=args.resolution_list,
+            patch_size=args.patch_size,
+            feature_extractor=args.feature_extractor,
+            num_workers=args.num_workers,
+        )
+        train_dm.use_weighted_sampler = getattr(args, "use_weighted_sampler", False)
+        train_dm.sampler_power = getattr(args, "sampler_power", 1.0)
+        train_dm.setup()
 
-            train_dm = SurvivalWSIDataModule(
-                dataset_root=args.dataset_root,
-                dataset_name=train_ds_name,
-                feature_extractor=args.feature_extractor,
-                resolutions=args.resolution_list,
-                patch_size=args.patch_size,
-                num_workers=args.num_workers,
-                survival_endpoint=args.survival_endpoint,
-                survival_event_key=args.survival_event_key,
-                survival_time_key=args.survival_time_key,
-                drop_no_survival=True,
-            )
-            train_dm.setup()
-
-            loss_weight = None
-            combined_train_name = str(train_ds_name)
-
-        else:
-            train_dm = CombinedPatchFeaturesWSIDataModule(
-                dataset_root=args.dataset_root,
-                dataset_mode="train",
-                train_dataset_name=args.train_dataset_name,
-                resolutions=args.resolution_list,
-                patch_size=args.patch_size,
-                feature_extractor=args.feature_extractor,
-                num_workers=args.num_workers,
-            )
-            train_dm.use_weighted_sampler = getattr(args, "use_weighted_sampler", False)
-            train_dm.sampler_power = getattr(args, "sampler_power", 1.0)
-            train_dm.setup()
-
-            loss_weight = get_loss_weight(args, train_dm)
-            combined_train_name = "_".join(train_dm.train_dataset_name)
+        loss_weight = get_loss_weight(args, train_dm)
+        combined_train_name = "_".join(train_dm.train_dataset_name)
 
         # --------------------------------------
-        # Test DataModules (mode별)
+        # Test DataModules
         # --------------------------------------
         test_dm_dict = {}
         for tde in sorted(test_dataset_info):
-            if args.train_mode == "survival":
-                dm = SurvivalWSIDataModule(
-                    dataset_root=args.dataset_root,
-                    dataset_name=tde,
-                    feature_extractor=args.feature_extractor,
-                    resolutions=args.resolution_list,
-                    patch_size=args.patch_size,
-                    num_workers=args.num_workers,
-                    survival_endpoint=args.survival_endpoint,
-                    survival_event_key=args.survival_event_key,
-                    survival_time_key=args.survival_time_key,
-                    drop_no_survival=True,
-                )
-                dm.setup()
-            else:
-                dm = CombinedPatchFeaturesWSIDataModule(
-                    dataset_root=args.dataset_root,
-                    dataset_mode="test",
-                    train_dataset_name=[tde],
-                    resolutions=args.resolution_list,
-                    patch_size=args.patch_size,
-                    feature_extractor=args.feature_extractor,
-                    num_workers=args.num_workers,
-                )
-                dm.setup()
-
+            dm = CombinedPatchFeaturesWSIDataModule(
+                dataset_root=args.dataset_root,
+                dataset_mode="test",
+                train_dataset_name=[tde],
+                resolutions=args.resolution_list,
+                patch_size=args.patch_size,
+                feature_extractor=args.feature_extractor,
+                num_workers=args.num_workers,
+            )
+            dm.setup()
             test_dm_dict[tde] = dm
 
         # --------------------------------------
-        # Model init
+        # Model init (train dataset 기준 class)
         # --------------------------------------
-        if args.train_mode in {"classification", "grading"}:
-            train_class_names = get_class_names(args.train_dataset_name[0])
-            train_num_classes = len(train_class_names)
-        else:
-            K = int(args.survival_num_bins)
-            train_class_names = [f"bin_{i}" for i in range(K)]
-            train_num_classes = K
+        train_class_names = get_class_names(args.train_dataset_name[0])
+        train_num_classes = len(train_class_names)
 
         model = get_model_module(
             args=args,
@@ -329,13 +249,8 @@ def main(args):
             patch_path=args.patch_path,
         )
 
-        # ---- train save dir (mode별)
-        if args.train_mode == "classification":
-            train_subdir = "ce"
-        elif args.train_mode == "grading":
-            train_subdir = "grading"
-        else:
-            train_subdir = "survival"
+        # ---- Train save dir (per mode)
+        train_subdir = "ce" if args.train_mode == "classification" else "grading"
 
         save_seed_dir = exp_base_dir / "train" / train_subdir / f"seed_{seed}"
         save_seed_dir.mkdir(parents=True, exist_ok=True)
@@ -365,10 +280,8 @@ def main(args):
 
         if args.train_mode == "classification":
             analysis_cb = SaveAnalysisResultsCallback()
-        elif args.train_mode == "grading":
-            analysis_cb = SaveGradingAnalysisResultsCallback()
         else:
-            analysis_cb = SaveSurvivalAnalysisResultsCallback()
+            analysis_cb = SaveGradingAnalysisResultsCallback()
 
         logger = CSVLogger(save_seed_dir)
         gpu_ids = _ensure_list(args.gpu_id)
@@ -387,10 +300,10 @@ def main(args):
             accumulate_grad_batches=int(getattr(args, "accumulate_grad_batches", 1)),
         )
 
-        # ---- fit
+        # ---- Fit
         trainer.fit(model, train_dm)
 
-        # ---- test per dataset (best ckpt)
+        # ---- Test per dataset (best ckpt)
         for tde, test_dm in test_dm_dict.items():
             model.test_dataset_element_name = tde
             model.test_class_names_list = test_dataset_info[tde]["test_class_names_list"]
@@ -398,84 +311,66 @@ def main(args):
             print(f"\n[Test] Testing on {tde} ...")
             test_results = trainer.test(model, test_dm, ckpt_path="best")
 
-            if args.train_mode in {"classification", "grading"}:
-                probs = torch.cat(model.y_prob_list, dim=0).detach().cpu()
-                labels = torch.cat(model.label_list, dim=0).detach().cpu()
-                names = [n[0] if isinstance(n, (tuple, list)) else n for n in model.names]
+            probs = torch.cat(model.y_prob_list, dim=0).detach().cpu()
+            labels = torch.cat(model.label_list, dim=0).detach().cpu()
+            names = [n[0] if isinstance(n, (tuple, list)) else n for n in model.names]
 
-                all_seed_logits_dict[tde].append(probs)
-                all_seed_labels_dict[tde].append(labels)
-                all_seed_names_dict[tde].append(names)
+            all_seed_logits_dict[tde].append(probs)
+            all_seed_labels_dict[tde].append(labels)
+            all_seed_names_dict[tde].append(names)
 
-                if args.train_mode == "classification":
-                    make_single_result_metrics(
-                        args=args,
-                        seed=seed,
-                        trainer_model=model,
-                        test_results=test_results,
-                        test_dataset_element_name=tde,
-                        num_classes=test_dataset_info[tde]["test_num_classes"],
-                    )
-                else:
-                    make_single_result_grading_metrics(
-                        args=args,
-                        seed=seed,
-                        trainer_model=model,
-                        test_results=test_results,
-                        test_dataset_element_name=tde,
-                        num_classes=test_dataset_info[tde]["test_num_classes"],
-                    )
-
-            else:
-                make_single_result_survival_metrics(
+            if args.train_mode == "classification":
+                make_single_result_metrics(
                     args=args,
                     seed=seed,
                     trainer_model=model,
                     test_results=test_results,
                     test_dataset_element_name=tde,
-                )
-
-    # ------------------------------
-    # 3) ensemble (mode별)
-    # ------------------------------
-    for tde in test_dataset_info:
-        if args.train_mode in {"classification", "grading"}:
-            if len(all_seed_logits_dict[tde]) == 0:
-                print(f"[{tde}] No predictions collected. Skipping ensemble.")
-                continue
-
-            mean_probs = torch.mean(torch.stack(all_seed_logits_dict[tde]), dim=0)
-            final_labels = all_seed_labels_dict[tde][0]
-            slide_names = all_seed_names_dict[tde][0]
-
-            if args.train_mode == "classification":
-                make_whole_result_metrics(
-                    args=args,
-                    test_dataset_element_name=tde,
                     num_classes=test_dataset_info[tde]["test_num_classes"],
-                    class_names_list=test_dataset_info[tde]["test_class_names_list"],
-                    save_dir=exp_base_dir,
-                    mean_logits=mean_probs,
-                    final_labels=final_labels,
-                    slide_names=slide_names,
                 )
             else:
-                make_whole_result_grading_metrics(
+                make_single_result_grading_metrics(
                     args=args,
+                    seed=seed,
+                    trainer_model=model,
+                    test_results=test_results,
                     test_dataset_element_name=tde,
                     num_classes=test_dataset_info[tde]["test_num_classes"],
-                    class_names_list=test_dataset_info[tde]["test_class_names_list"],
-                    save_dir=exp_base_dir,
-                    mean_logits=mean_probs,
-                    final_labels=final_labels,
-                    slide_names=slide_names,
                 )
 
-        else:
-            make_whole_result_survival_metrics(
+    # ------------------------------
+    # 3) Ensemble (per mode)
+    # ------------------------------
+    for tde in test_dataset_info:
+        if len(all_seed_logits_dict[tde]) == 0:
+            print(f"[{tde}] No predictions collected. Skipping ensemble.")
+            continue
+
+        mean_probs = torch.mean(torch.stack(all_seed_logits_dict[tde]), dim=0)
+        final_labels = all_seed_labels_dict[tde][0]
+        slide_names = all_seed_names_dict[tde][0]
+
+        if args.train_mode == "classification":
+            make_whole_result_metrics(
                 args=args,
                 test_dataset_element_name=tde,
+                num_classes=test_dataset_info[tde]["test_num_classes"],
+                class_names_list=test_dataset_info[tde]["test_class_names_list"],
                 save_dir=exp_base_dir,
+                mean_logits=mean_probs,
+                final_labels=final_labels,
+                slide_names=slide_names,
+            )
+        else:
+            make_whole_result_grading_metrics(
+                args=args,
+                test_dataset_element_name=tde,
+                num_classes=test_dataset_info[tde]["test_num_classes"],
+                class_names_list=test_dataset_info[tde]["test_class_names_list"],
+                save_dir=exp_base_dir,
+                mean_logits=mean_probs,
+                final_labels=final_labels,
+                slide_names=slide_names,
             )
 
     print("All seeds processing finished.")
@@ -497,7 +392,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     args = auto_adjust_for_camelyon(args)
 
-    # patch drop sanity
+    # Patch drop sanity checks
     if args.mil_patch_drop_min < 0.0 or args.mil_patch_drop_max < 0.0:
         raise ValueError("mil_patch_drop_min / mil_patch_drop_max must be >= 0.0")
     if args.mil_patch_drop_max < args.mil_patch_drop_min:

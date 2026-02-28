@@ -1,10 +1,12 @@
+# model/clam.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
 
-def initialize_weights(module):
+def initialize_weights(module: nn.Module) -> None:
+    """Initialize weights for Linear and BatchNorm1d layers."""
     for m in module.modules():
         if isinstance(m, nn.Linear):
             nn.init.xavier_normal_(m.weight)
@@ -19,7 +21,7 @@ def initialize_weights(module):
 # Attention Network (no gate)
 # ===========================
 class Attn_Net(nn.Module):
-    def __init__(self, L=1024, D=256, dropout=False, n_classes=1):
+    def __init__(self, L: int = 1024, D: int = 256, dropout: bool = False, n_classes: int = 1):
         super().__init__()
         layers = [
             nn.Linear(L, D),
@@ -30,9 +32,14 @@ class Attn_Net(nn.Module):
         layers.append(nn.Linear(D, n_classes))
         self.module = nn.Sequential(*layers)
 
-    def forward(self, x):
-        # x: [N, L]
-        # return: [N, n_classes], x
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: [N, L]
+        Returns:
+            A: [N, n_classes] (unnormalized attention scores)
+            x: [N, L] (input features, returned for convenience)
+        """
         return self.module(x), x
 
 
@@ -40,7 +47,7 @@ class Attn_Net(nn.Module):
 # Attention Network (gated)
 # ===============================
 class Attn_Net_Gated(nn.Module):
-    def __init__(self, L=1024, D=256, dropout=False, n_classes=1):
+    def __init__(self, L: int = 1024, D: int = 256, dropout: bool = False, n_classes: int = 1):
         super().__init__()
         attn_a = [
             nn.Linear(L, D),
@@ -58,11 +65,18 @@ class Attn_Net_Gated(nn.Module):
         self.attention_b = nn.Sequential(*attn_b)
         self.attention_c = nn.Linear(D, n_classes)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x: [N, L]
+        Returns:
+            A: [N, n_classes] (unnormalized attention scores)
+            x: [N, L] (input features, returned for convenience)
+        """
         a = self.attention_a(x)
         b = self.attention_b(x)
-        A = a * b           # [N, D]
-        A = self.attention_c(A)  # [N, n_classes]
+        A = a * b                    # [N, D]
+        A = self.attention_c(A)      # [N, n_classes]
         return A, x
 
 
@@ -72,15 +86,15 @@ class Attn_Net_Gated(nn.Module):
 class CLAM_SB(nn.Module):
     def __init__(
         self,
-        gate=True,
-        size_arg="small",
-        dropout=False,
-        k_sample=8,
-        n_classes=2,
-        instance_loss_fn="ce",   # 🔥 SVM 제거, CE만 사용
-        subtyping=False,
-        embed_dim=1024,
-        bag_weight=0.7,
+        gate: bool = True,
+        size_arg: str = "small",
+        dropout: bool = False,
+        k_sample: int = 8,
+        n_classes: int = 2,
+        instance_loss_fn: str = "ce",   # SVM removed; only CE is used
+        subtyping: bool = False,
+        embed_dim: int = 1024,
+        bag_weight: float = 0.7,
     ):
         super().__init__()
 
@@ -95,7 +109,7 @@ class CLAM_SB(nn.Module):
         self.n_classes = n_classes
         self.subtyping = subtyping
 
-        # Feature → attention input
+        # Feature -> attention input projection
         fc = [nn.Linear(size[0], size[1]), nn.ReLU()]
         if dropout:
             fc.append(nn.Dropout(0.25))
@@ -112,46 +126,53 @@ class CLAM_SB(nn.Module):
         # Bag-level classifier
         self.classifiers = nn.Linear(size[1], n_classes)
 
-        # Instance-level classifier (positive / negative)
+        # Instance-level classifiers (positive / negative)
         inst_cls = [nn.Linear(size[1], 2) for _ in range(n_classes)]
         self.instance_classifiers = nn.ModuleList(inst_cls)
 
-        # 🔥 Instance loss: CrossEntropy로 통일
+        # Instance loss: unified to CrossEntropy
         self.instance_loss_fn = nn.CrossEntropyLoss()
 
         initialize_weights(self)
 
     @staticmethod
-    def create_positive_targets(k, device):
+    def create_positive_targets(k: int, device: torch.device) -> torch.Tensor:
+        """Create positive targets of shape [k] with label 1."""
         return torch.full((k,), 1, device=device, dtype=torch.long)
 
     @staticmethod
-    def create_negative_targets(k, device):
+    def create_negative_targets(k: int, device: torch.device) -> torch.Tensor:
+        """Create negative targets of shape [k] with label 0."""
         return torch.full((k,), 0, device=device, dtype=torch.long)
 
     # In-class instance-level evaluation
-    def inst_eval(self, A, h, classifier):
+    def inst_eval(self, A: torch.Tensor, h: torch.Tensor, classifier: nn.Module):
         """
-        A: [N] or [1, N]
-        h: [N, D]
+        Args:
+            A: [N] or [1, N] attention scores for a single class
+            h: [N, D] instance features
+        Returns:
+            instance_loss: scalar tensor
+            preds: [2k] predicted instance labels
+            all_targets: [2k] ground-truth instance labels
         """
         device = h.device
 
         if A.dim() == 1:
             A = A.view(1, -1)  # [1, N]
 
-        # top-k positive / negative
-        top_p_ids = torch.topk(A, self.k_sample, dim=1)[1][-1]   # [k]
-        top_n_ids = torch.topk(-A, self.k_sample, dim=1)[1][-1]  # [k]
+        # Select top-k positive / negative instances
+        top_p_ids = torch.topk(A, self.k_sample, dim=1)[1][-1]    # [k]
+        top_n_ids = torch.topk(-A, self.k_sample, dim=1)[1][-1]   # [k]
 
-        top_p = h.index_select(0, top_p_ids)       # [k, D]
-        top_n = h.index_select(0, top_n_ids)       # [k, D]
+        top_p = h.index_select(0, top_p_ids)  # [k, D]
+        top_n = h.index_select(0, top_n_ids)  # [k, D]
 
         p_targets = self.create_positive_targets(self.k_sample, device)
         n_targets = self.create_negative_targets(self.k_sample, device)
 
-        all_instances = torch.cat([top_p, top_n], dim=0)          # [2k, D]
-        all_targets = torch.cat([p_targets, n_targets], dim=0)    # [2k]
+        all_instances = torch.cat([top_p, top_n], dim=0)        # [2k, D]
+        all_targets = torch.cat([p_targets, n_targets], dim=0)  # [2k]
 
         logits = classifier(all_instances)  # [2k, 2]
         instance_loss = self.instance_loss_fn(logits, all_targets)
@@ -160,7 +181,16 @@ class CLAM_SB(nn.Module):
         return instance_loss, preds, all_targets
 
     # Out-of-class instance-level evaluation
-    def inst_eval_out(self, A, h, classifier):
+    def inst_eval_out(self, A: torch.Tensor, h: torch.Tensor, classifier: nn.Module):
+        """
+        Args:
+            A: [N] or [1, N] attention scores for a single class
+            h: [N, D] instance features
+        Returns:
+            instance_loss: scalar tensor
+            preds: [k] predicted instance labels
+            targets: [k] ground-truth instance labels (all 0)
+        """
         device = h.device
         if A.dim() == 1:
             A = A.view(1, -1)
@@ -169,7 +199,7 @@ class CLAM_SB(nn.Module):
         top_p = h.index_select(0, top_p_ids)  # [k, D]
 
         targets = self.create_negative_targets(self.k_sample, device)
-        logits = classifier(top_p)           # [k, 2]
+        logits = classifier(top_p)  # [k, 2]
         instance_loss = self.instance_loss_fn(logits, targets)
         preds = torch.argmax(logits, dim=1)
 
@@ -177,15 +207,25 @@ class CLAM_SB(nn.Module):
 
     def forward(
         self,
-        h,
-        label=None,
-        instance_eval=False,
-        return_features=False,
-        attention_only=False,
+        h: torch.Tensor,
+        label: torch.Tensor = None,
+        instance_eval: bool = False,
+        return_features: bool = False,
+        attention_only: bool = False,
     ):
         """
-        h: [N, embed_dim]
-        label: scalar long tensor (bag label)
+        Args:
+            h: [N, embed_dim] instance features in a bag
+            label: scalar long tensor (bag label). Optional.
+            instance_eval: whether to compute instance-level loss/preds
+            return_features: whether to return bag-level features
+            attention_only: if True, return raw attention only
+        Returns:
+            logits: [1, n_classes]
+            Y_prob: [1, n_classes]
+            Y_hat: [1]
+            A_raw: [1, N] raw attention scores (before softmax)
+            results_dict: dict with optional instance-level outputs / features
         """
         device = h.device
 
@@ -202,7 +242,7 @@ class CLAM_SB(nn.Module):
         all_preds, all_targets = [], []
 
         if instance_eval and label is not None:
-            # label: scalar → one-hot: [n_classes]
+            # Convert scalar label to one-hot: [n_classes]
             inst_labels = F.one_hot(label, num_classes=self.n_classes).squeeze(0)
 
             for i in range(self.n_classes):
@@ -210,10 +250,10 @@ class CLAM_SB(nn.Module):
                 classifier = self.instance_classifiers[i]
 
                 if inst_label == 1:
-                    # in-class branch
+                    # In-class branch
                     instance_loss, preds, targets = self.inst_eval(A, h, classifier)
                 else:
-                    # out-of-class branch (optional, only if subtyping)
+                    # Out-of-class branch (optional, only if subtyping)
                     if self.subtyping:
                         instance_loss, preds, targets = self.inst_eval_out(A, h, classifier)
                     else:
@@ -227,8 +267,8 @@ class CLAM_SB(nn.Module):
                 total_inst_loss = total_inst_loss / len(self.instance_classifiers)
 
         # Bag-level representation
-        M = torch.mm(A, h)           # [1, H]
-        logits = self.classifiers(M) # [1, n_classes]
+        M = torch.mm(A, h)            # [1, H]
+        logits = self.classifiers(M)  # [1, n_classes]
         Y_hat = torch.argmax(logits, dim=1)
         Y_prob = F.softmax(logits, dim=1)
 
@@ -250,15 +290,15 @@ class CLAM_SB(nn.Module):
 class CLAM_MB(CLAM_SB):
     def __init__(
         self,
-        gate=True,
-        size_arg="small",
-        dropout=False,
-        k_sample=8,
-        n_classes=2,
-        instance_loss_fn="ce",   # 🔥 동일하게 CE만 사용
-        subtyping=False,
-        embed_dim=1024,
-        bag_weight=0.7,
+        gate: bool = True,
+        size_arg: str = "small",
+        dropout: bool = False,
+        k_sample: int = 8,
+        n_classes: int = 2,
+        instance_loss_fn: str = "ce",   # same: only CE is used
+        subtyping: bool = False,
+        embed_dim: int = 1024,
+        bag_weight: float = 0.7,
     ):
         nn.Module.__init__(self)
 
@@ -285,27 +325,35 @@ class CLAM_MB(CLAM_SB):
         fc.append(attn_net)
         self.attention_net = nn.Sequential(*fc)
 
+        # Per-class bag classifier heads (each outputs a scalar)
         bag_classifiers = [nn.Linear(size[1], 1) for _ in range(n_classes)]
         self.classifiers = nn.ModuleList(bag_classifiers)
 
         inst_cls = [nn.Linear(size[1], 2) for _ in range(n_classes)]
         self.instance_classifiers = nn.ModuleList(inst_cls)
 
-        # 🔥 마찬가지로 CE만 사용
+        # Instance loss: unified to CrossEntropy
         self.instance_loss_fn = nn.CrossEntropyLoss()
 
         initialize_weights(self)
 
     def forward(
         self,
-        h,
-        label=None,
-        instance_eval=False,
-        return_features=False,
-        attention_only=False,
+        h: torch.Tensor,
+        label: torch.Tensor = None,
+        instance_eval: bool = False,
+        return_features: bool = False,
+        attention_only: bool = False,
     ):
         """
-        h: [N, embed_dim]
+        Args:
+            h: [N, embed_dim]
+        Returns:
+            logits: [1, n_classes]
+            Y_prob: [1, n_classes]
+            Y_hat: [1]
+            A_raw: [K, N] raw attention scores (before softmax)
+            results_dict: dict with optional instance-level outputs / features
         """
         device = h.device
 
@@ -344,7 +392,7 @@ class CLAM_MB(CLAM_SB):
                 total_inst_loss = total_inst_loss / len(self.instance_classifiers)
 
         # Bag-level logits (per-class branch)
-        M = torch.mm(A, h)   # [K, H]
+        M = torch.mm(A, h)  # [K, H]
         logits = torch.empty(1, self.n_classes, device=device)
         for c in range(self.n_classes):
             logits[0, c] = self.classifiers[c](M[c])

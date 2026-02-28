@@ -15,13 +15,13 @@ class MILTrainerModule(pl.LightningModule):
         self,
         args,
         seed,
-        test_dataset_element_name,  # 로깅 경로 생성용
-        test_class_names_list,      # 분석용 클래스 이름
+        test_dataset_element_name,  # For creating logging paths
+        test_class_names_list,      # Class names for analysis
         num_classes,
         resolution_str,
         classifier,
         loss_func,
-        metrics,                    # (main.py에서 넘겨주는 기본 metrics)
+        metrics,                    # (Default metrics passed from main.py)
         forward_func="general",
         attention_func=None,
         patch_path=None,
@@ -37,32 +37,32 @@ class MILTrainerModule(pl.LightningModule):
         self.test_class_names_list = test_class_names_list
         self.patch_path = patch_path
 
-        # 🔥 main.py에서 만든 공통 base 경로 (results/.../mil/fe/)
+        # 🔥 Common base path created in main.py (results/.../mil/fe/)
         self.base_save_dir = getattr(self.args, "base_save_dir", None)
 
-        # 모델 컴포넌트
+        # Model components
         self.classifier = classifier
         self.loss_func = loss_func
         self.forward_func = forward_func
 
-        # attention 함수:
-        #   - 내부용 callable: self.attention_forward
-        #   - callback 호환용 bool flag: self.attention_func
+        # Attention function:
+        #   - Internal callable: self.attention_forward
+        #   - Bool flag for callback compatibility: self.attention_func
         self.attention_forward = attention_func
         self.attention_func = attention_func is not None
 
-        # Optimization 설정 (일반 MIL은 자동 최적화 사용)
+        # Optimization settings (Standard MIL uses automatic optimization)
         self.automatic_optimization = True
 
-        # Patch Drop 설정 (DTFD와 동일한 방식)
+        # Patch Drop settings (Same method as DTFD)
         self.mil_patch_drop_min = float(getattr(self.args, "mil_patch_drop_min", 0.0))
         self.mil_patch_drop_max = float(getattr(self.args, "mil_patch_drop_max", 0.0))
         self._use_patch_drop = self.mil_patch_drop_max > 0.0
 
-        # Weighted Sampler 사용 플래그 (val 모니터링 기준 변경용)
+        # Flag for using Weighted Sampler (for changing val monitoring criteria)
         self.use_weighted_sampler = bool(getattr(self.args, "use_weighted_sampler", False))
 
-        # Metrics 설정 (TorchMetrics 활용)
+        # Metrics setup (using TorchMetrics)
         balanced_acc = MulticlassAccuracy(num_classes=num_classes, average="macro")
 
         self.train_metrics = metrics.clone(prefix="train/")
@@ -84,10 +84,10 @@ class MILTrainerModule(pl.LightningModule):
             prefix="final_test/",
         )
 
-        # Callback으로 넘겨줄 데이터 버퍼
+        # Data buffer to pass to the Callback
         self.test_outputs = []
 
-        # 🔥 save_metrics.py 호환용 버퍼 (seed별 / ensemble 계산용)
+        # 🔥 Buffer for compatibility with save_metrics.py (for seed-wise / ensemble calculations)
         self.y_prob_list = []
         self.label_list = []
         self.names = []
@@ -99,7 +99,7 @@ class MILTrainerModule(pl.LightningModule):
     # --------------------------------
     def forward(self, feats, label=None):
         """
-        forward_func는 다음 형식을 가정:
+        forward_func assumes the following format:
           y_logit, loss, y_prob = forward_func(feats, classifier, loss_func, num_classes, label=label)
         """
         return self.forward_func(
@@ -112,7 +112,7 @@ class MILTrainerModule(pl.LightningModule):
 
     def get_attention_maps(self, feats, label=None):
         """
-        attention_forward는 다음 형식을 가정:
+        attention_forward assumes the following format:
           y_logit, loss, y_prob, attn_map = attention_forward(...)
         """
         return self.attention_forward(
@@ -157,7 +157,7 @@ class MILTrainerModule(pl.LightningModule):
         if self._use_patch_drop:
             feats = self._random_patch_subsample(feats)
 
-        # Label 처리
+        # Handle Label
         target_label = label
         label_idx = label
         if isinstance(label, torch.Tensor) and label.ndim > 1:
@@ -167,29 +167,29 @@ class MILTrainerModule(pl.LightningModule):
             target_label = label.long()
             label_idx = label.long()
 
-        # forward_func는 (y_logit, loss, y_prob) 반환
+        # forward_func returns (y_logit, loss, y_prob)
         y_logit, loss, y_prob = self.forward(feats, label=target_label)
 
-        # train metric은 logits 기준으로 업데이트
+        # train metric is updated based on logits
         self.train_metrics.update(y_logit.detach(), label_idx)
 
-        # 🔥 Progress Bar용 (logger에는 기록하지 않음 → I/O 감소)
+        # 🔥 For Progress Bar (do not log to logger -> reduces I/O)
         self.log(
             "train_loss",
             loss,
-            on_step=True,        # step마다 pbar 업데이트
+            on_step=True,        # Update pbar every step
             on_epoch=False,
             sync_dist=False,
             batch_size=self.args.batch_size,
             prog_bar=True,
-            logger=False,        # CSVLogger 등에는 기록 X
+            logger=False,        # Do not record in CSVLogger, etc.
         )
-        # 🔥 내부 기록용: epoch 평균만 logger에 기록 (기존 Loss/train과 의미 동일)
+        # 🔥 For internal recording: log only epoch averages to the logger (same meaning as original Loss/train)
         self.log(
             "Loss/train",
             loss,
-            on_step=False,       # step별 로깅 제거
-            on_epoch=True,       # epoch 평균만 기록
+            on_step=False,       # Remove per-step logging
+            on_epoch=True,       # Log only epoch averages
             sync_dist=False,
             batch_size=self.args.batch_size,
             prog_bar=False,
@@ -199,7 +199,7 @@ class MILTrainerModule(pl.LightningModule):
         return loss
 
     def on_train_epoch_end(self):
-        # Epoch 단위 metric 집계
+        # Aggregate metrics per epoch
         self.log_dict(self.train_metrics.compute(), sync_dist=False)
         self.train_metrics.reset()
 
@@ -217,7 +217,7 @@ class MILTrainerModule(pl.LightningModule):
 
         y_logit, loss, y_prob = self.forward(feats, label=target_label)
 
-        # val metric도 logits 기준
+        # val metric also based on logits
         self.val_metrics.update(y_logit.detach(), label_idx)
 
         # Progress Bar
@@ -230,7 +230,7 @@ class MILTrainerModule(pl.LightningModule):
             batch_size=self.args.batch_size,
             prog_bar=True,
         )
-        # Checkpoint용
+        # For Checkpoint
         self.log(
             "Loss/val",
             loss,
@@ -247,11 +247,11 @@ class MILTrainerModule(pl.LightningModule):
 
         print(f"[VAL][seed={self.seed}] Balanced Accuracy (macro): {bal_acc:.2f}%")
 
-        # Monitor용 + Progress bar용
+        # For Monitor + Progress bar
         self.log("ACC_balanced/val", bal_acc, sync_dist=False)
         self.log("val_bacc", bal_acc, prog_bar=True, sync_dist=False)
 
-        # Weighted Sampler 사용 시 Loss 모니터링용 대체 값
+        # Alternative value for monitoring Loss when using Weighted Sampler
         if getattr(self.args, "use_weighted_sampler", False):
             self.log("Loss/val_monitor", 100.0 - bal_acc, sync_dist=False)
 
@@ -262,7 +262,7 @@ class MILTrainerModule(pl.LightningModule):
     # Test Hooks
     # --------------------------
     def on_test_epoch_start(self):
-        # seed / 데이터셋마다 초기화
+        # Initialize per seed / dataset
         self.test_outputs = []
         self.y_prob_list = []
         self.label_list = []
@@ -282,14 +282,14 @@ class MILTrainerModule(pl.LightningModule):
             target_label = label.long()
             label_idx = label.long()
 
-        # Attention Map이 필요한 경우 처리
+        # Handle cases requiring Attention Map
         attn_map = None
         if self.attention_forward is not None:
             y_logit, loss, y_prob, attn_map = self.get_attention_maps(feats, label=target_label)
         else:
             y_logit, loss, y_prob = self.forward(feats, label=target_label)
 
-        # test_metrics에는 ECE가 있으므로 probability 기반으로 업데이트
+        # test_metrics has ECE, so update based on probability
         self.test_metrics.update(y_prob.detach(), label_idx)
         self.log(
             "Loss/final_test",
@@ -299,43 +299,43 @@ class MILTrainerModule(pl.LightningModule):
             batch_size=self.args.batch_size,
         )
 
-        # Callback 분석을 위한 데이터 저장
+        # Save data for Callback analysis
         slide_name = name[0] if isinstance(name, (list, tuple)) else name
 
         self.test_outputs.append(
             {
                 "name": slide_name,
-                "coords": coords,                     # 좌표는 일반적으로 CPU tensor/list
-                "probs": y_prob.detach().cpu(),      # (1, C) 혹은 (G, C)
+                "coords": coords,                      # Coordinates are generally CPU tensor/list
+                "probs": y_prob.detach().cpu(),      # (1, C) or (G, C)
                 "label": label_idx.detach().cpu(),   # (1,)
                 "attn": attn_map.detach().cpu() if attn_map is not None else None,
             }
         )
 
-        # 🔥 save_metrics.py 호환용 버퍼
+        # 🔥 Buffer for compatibility with save_metrics.py
         self.y_prob_list.append(y_prob.detach().cpu())
         self.label_list.append(label_idx.detach().cpu())
         self.names.append(slide_name)
 
     def on_test_epoch_end(self):
-        # 1) 메트릭 집계
+        # 1) Aggregate metrics
         self.log_dict(self.test_metrics.compute(), sync_dist=False)
         self.test_metrics.reset()
 
-        # 2) save_metrics.py 호환용 속성 채우기
+        # 2) Fill attributes for compatibility with save_metrics.py
         if len(self.y_prob_list) > 0:
-            # (N, C) 확률 텐서
+            # (N, C) probability tensor
             self.logits = torch.cat(self.y_prob_list, dim=0).detach().cpu()
         else:
             self.logits = None
 
         if len(self.label_list) > 0:
-            # (N,) 라벨 텐서
+            # (N,) label tensor
             self.labels = torch.cat(self.label_list, dim=0).detach().cpu()
         else:
             self.labels = None
-        # self.names는 리스트 그대로 사용
-        # self.test_outputs는 callbacks.analysis_callback에서 사용 후 비워짐
+        # Use self.names as a list directly
+        # self.test_outputs is emptied after being used in callbacks.analysis_callback
 
     # --------------------------------
     # Optimizer & Scheduler

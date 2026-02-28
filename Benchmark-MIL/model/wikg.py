@@ -1,11 +1,10 @@
 # model/wikg.py
-# model/wikg.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import global_mean_pool, global_max_pool, GlobalAttention
 
-# Anomaly detection은 디버깅 시에만 True로 설정 권장
+# It is recommended to set Anomaly detection to True only during debugging
 torch.autograd.set_detect_anomaly(False)
 
 class WiKG(nn.Module):
@@ -161,7 +160,7 @@ class WiKG(nn.Module):
             attn_logits = self.readout.gate_nn(h_squeezed)
             attn_scores = torch.sigmoid(attn_logits).squeeze(-1) # [N]
         else:
-            # Mean/Max pooling은 attention score가 없으므로 uniform 값 반환
+            # Mean/Max pooling does not have attention scores, so return uniform values
             attn_scores = torch.ones(h_squeezed.size(0), device=h.device) / h_squeezed.size(0)
 
         h_pooled = self.readout(h_squeezed, batch=None)

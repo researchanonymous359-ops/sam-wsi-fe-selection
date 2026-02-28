@@ -32,7 +32,7 @@ REVERSE_FOLDER_ALIASES = {v: k for k, v in FOLDER_NAME_ALIASES.items()}
 # ==========================================
 
 def add_common_arguments(parser):
-    """공통적으로 사용되는 모든 인자 정의"""
+    """Define arguments commonly used across classification/grading tasks."""
 
     # --- [System & Hardware] ---
     group_sys = parser.add_argument_group("System & Hardware")
@@ -96,18 +96,15 @@ def add_common_arguments(parser):
         "--train-mode",
         type=str,
         default="classification",
-        choices=["classification", "grading", "survival"],
+        choices=["classification", "grading"],
         help=(
             "Training objective (default: classification).\n"
             "- classification: standard multi-class CE\n"
-            "- grading: ordinal-aware cost-sensitive CE (distance penalty)  ✅ auto-enabled\n"
-            "- survival: discrete-time hazard learning"
+            "- grading: ordinal-aware cost-sensitive CE (distance penalty)  ✅ auto-enabled"
         ),
     )
 
     # --- [Grading / Ordinal Loss Options] ---
-    # 목표: train-mode=grading이면 cost-sensitive CE 자동 적용
-
     group_grade = parser.add_argument_group("Grading (Ordinal / Cost-sensitive CE)")
 
     group_grade.add_argument(
@@ -129,10 +126,7 @@ def add_common_arguments(parser):
         "--grading-cost-lambda",
         type=float,
         default=0.5,
-        help=(
-            "Penalty weight alpha (default: 0.5). "
-            "Set to 0 to recover standard CE."
-        ),
+        help="Penalty weight alpha (default: 0.5). Set to 0 to recover standard CE.",
     )
 
     group_grade.add_argument(
@@ -146,34 +140,6 @@ def add_common_arguments(parser):
         type=float,
         default=1e-8,
         help="Epsilon for numerical stability (default: 1e-8)",
-    )
-
-    # --- [Survival] ---
-    group_task.add_argument(
-        "--survival-endpoint",
-        type=str,
-        default=None,
-        choices=["OS", "PFI"],
-        help="Survival endpoint to use. If None, auto: HNSC->PFI else OS.",
-    )
-    group_task.add_argument(
-        "--survival-num-bins",
-        dest="survival_num_bins",
-        type=int,
-        default=5,
-        help="Number of discrete-time bins for survival (default: 5).",
-    )
-    group_task.add_argument(
-        "--survival-event-key",
-        type=str,
-        default=None,
-        help="[Optional] Event key under /survival (override). Default: same as endpoint.",
-    )
-    group_task.add_argument(
-        "--survival-time-key",
-        type=str,
-        default=None,
-        help="[Optional] Time key under /survival (override). Default: <endpoint>_time.",
     )
 
     # --- [Model Structure] ---
@@ -197,7 +163,7 @@ def add_common_arguments(parser):
             "RRTMIL",
             "ILRA",
         ],
-        help="MIL Architecture to use",
+        help="MIL architecture to use",
     )
     group_model.add_argument("--attention", action="store_true", default=False, help="Enable attention map generation")
     group_model.add_argument(
@@ -212,7 +178,7 @@ def add_common_arguments(parser):
     group_train = parser.add_argument_group("Training")
     group_train.add_argument("--epochs", type=int, default=200, help="Total number of epochs (default: 200)")
     group_train.add_argument("--batch-size", type=int, default=1, help="Batch size (default: 1)")
-    group_train.add_argument("--accumulate-grad-batches", type=int, default=1, help="Grad accumulation (default: 1)")
+    group_train.add_argument("--accumulate-grad-batches", type=int, default=1, help="Gradient accumulation (default: 1)")
     group_train.add_argument("--patience", type=int, default=10, help="Early stopping patience (default: 10)")
 
     group_train.add_argument("--lr", type=float, default=1e-4, help="Learning rate (default: 1e-4)")
@@ -224,7 +190,7 @@ def add_common_arguments(parser):
         default=None,
         help="Manual loss weights (classification only)",
     )
-    group_train.add_argument("--auto-loss-weight", action="store_true", help="Auto calculate class weights")
+    group_train.add_argument("--auto-loss-weight", action="store_true", help="Automatically compute class weights")
 
     group_train.add_argument("--mil-patch-drop-min", type=float, default=0.0, help="Min patch drop ratio (default: 0.0)")
     group_train.add_argument("--mil-patch-drop-max", type=float, default=0.0, help="Max patch drop ratio (default: 0.0)")
@@ -274,28 +240,24 @@ def add_mamba_arguments(parser):
 
 
 # ==========================================
-# 3. Post-Processing Logic
+# 3. Post-Processing Logic (Classification/Grading only)
 # ==========================================
 
 def post_process_args(args):
     """
-    Main 실행 전, 입력된 인자들을 검증하고 자동 설정을 수행합니다.
-    - feature extractor 폴더명 정규화
-    - num_feats 자동 계산
-    - survival endpoint/keys 자동설정 (train_mode == survival)
-    - survival bins sanity check
-    - grading args sanity (train_mode == grading)
-    - grading_cost_* -> forward_fn_grading.py 호환 grading_*로 자동 매핑
+    Validate inputs and apply automatic configurations before running main.
+    - Normalize feature-extractor folder name
+    - Auto-compute num_feats
+    - Sanity-check grading args (when train_mode == grading)
+    - Auto-map grading_cost_* to grading_* for forward_fn_grading.py compatibility
     """
     args = _resolve_feature_extractor_path(args)
     args = _auto_set_num_feats(args)
-    args = _auto_set_survival_keys(args)
-    args = _sanity_check_survival_bins(args)
 
-    # ✅ grading이면 loss 자동 적용되도록, sanity check 이전에 매핑부터 수행
+    # For grading mode, map arguments before sanity checks so loss is auto-enabled.
     args = _auto_map_grading_args_for_forward_fn(args)
-
     args = _sanity_check_grading_args(args)
+
     return args
 
 
@@ -375,43 +337,6 @@ def _auto_set_num_feats(args):
     return args
 
 
-def _auto_set_survival_keys(args):
-    if getattr(args, "train_mode", "classification") != "survival":
-        return args
-
-    if args.survival_endpoint is None:
-        base = args.train_dataset_name[0] if isinstance(args.train_dataset_name, list) else args.train_dataset_name
-        base_upper = str(base).upper()
-        if "HNSC" in base_upper:
-            args.survival_endpoint = "PFI"
-        else:
-            args.survival_endpoint = "OS"
-
-    if args.survival_event_key is None:
-        args.survival_event_key = args.survival_endpoint
-    if args.survival_time_key is None:
-        args.survival_time_key = f"{args.survival_endpoint}_time"
-
-    print(
-        f"[Auto-Config][Survival] endpoint={args.survival_endpoint} "
-        f"event_key={args.survival_event_key} time_key={args.survival_time_key} "
-        f"num_bins={getattr(args, 'survival_num_bins', None)}"
-    )
-    return args
-
-
-def _sanity_check_survival_bins(args):
-    if getattr(args, "train_mode", "classification") != "survival":
-        return args
-
-    nb = int(getattr(args, "survival_num_bins", 0))
-    if nb <= 1:
-        raise ValueError("--survival-num-bins must be >= 2 for discrete-time survival.")
-    if nb > 200:
-        print(f"[Warn] survival_num_bins={nb} is quite large. Consider 10~30 for TCGA.")
-    return args
-
-
 def _sanity_check_grading_args(args):
     if getattr(args, "train_mode", "classification") != "grading":
         return args
@@ -437,22 +362,20 @@ def _sanity_check_grading_args(args):
 
 
 def _auto_map_grading_args_for_forward_fn(args):
-    if args.train_mode != "grading":
+    if getattr(args, "train_mode", "classification") != "grading":
         return args
 
+    # Ensure grading loss is enabled by default when train_mode=grading
     args.grading_loss = "cost_sensitive_ce"
-    args.grading_alpha = float(args.grading_cost_lambda)
+    args.grading_alpha = float(getattr(args, "grading_cost_lambda", 0.5))
 
-    base_power = 1.0 if args.grading_cost_type == "abs" else 2.0
-    args.grading_power = base_power * float(args.grading_cost_gamma)
+    cost_type = str(getattr(args, "grading_cost_type", "sq")).lower()
+    base_power = 1.0 if cost_type == "abs" else 2.0
+    args.grading_power = base_power * float(getattr(args, "grading_cost_gamma", 1.0))
 
-    print(
-        f"[Auto-Config][Grading] "
-        f"alpha={args.grading_alpha}, power={args.grading_power}"
-    )
+    print(f"[Auto-Config][Grading] alpha={args.grading_alpha}, power={args.grading_power}")
     return args
 
 
-
-# 하위 호환성
+# Backward compatibility entrypoint name used by main.py
 auto_adjust_for_camelyon = post_process_args

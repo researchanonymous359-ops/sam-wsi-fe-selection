@@ -1,87 +1,102 @@
 # callbacks/analysis_callback.py
-import pytorch_lightning as pl
-import torch
+# -*- coding: utf-8 -*-
+
+import gc
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
 import numpy as np
 import pandas as pd
+import pytorch_lightning as pl
 import scipy.stats
-import matplotlib.pyplot as plt
 import seaborn as sns
-from pathlib import Path
-import gc
+import torch
+import matplotlib.pyplot as plt
 from sklearn.metrics import confusion_matrix
-from utils import save_attention_map  # utils.py에 해당 함수가 있다고 가정
+
+from utils import save_attention_map  # assumed to exist in utils.py
 
 
 class SaveAnalysisResultsCallback(pl.Callback):
-    def on_test_epoch_end(self, trainer, pl_module):
+    """
+    Callback to save analysis results (confusion matrix, prediction CSV, attention maps) at test end
+    """
+
+    def on_test_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
         """
-        테스트 에폭이 끝날 때 CSV 저장 및 시각화를 수행합니다.
+        Save CSVs and visualizations at the end of the test epoch.
         """
         # -------------------------
-        # 1. 저장 경로 설정
+        # 1. Setup save directory
         # -------------------------
         save_dir = self._get_save_dir(pl_module)
         save_dir.mkdir(parents=True, exist_ok=True)
         print(f"[Callback] Saving analysis results to {save_dir}")
 
         # -------------------------
-        # 2. 테스트 결과 수집
+        # 2. Collect test outputs
         # -------------------------
-        outputs = getattr(pl_module, "test_outputs", None)
+        outputs: Optional[List[Dict[str, Any]]] = getattr(pl_module, "test_outputs", None)
         if not outputs:
             print("[Callback] Warning: No test outputs found.")
             return
 
-        # probs: [N, C], labels: [N]
+        # outputs item expected keys:
+        # - "name": str
+        # - "probs": torch.Tensor [B, C] or [1, C]
+        # - "label": torch.Tensor [B] or [1]
+        # - (optional) "coords", "attn"
         names = [x["name"] for x in outputs]
-        probs = torch.cat([x["probs"] for x in outputs], dim=0).numpy()
-        labels = torch.cat([x["label"] for x in outputs], dim=0).numpy()
+
+        probs_t = torch.cat([x["probs"] for x in outputs], dim=0)
+        labels_t = torch.cat([x["label"] for x in outputs], dim=0)
+
+        # Move to CPU in case tensors are on GPU
+        probs = probs_t.detach().cpu().numpy()
+        labels = labels_t.detach().cpu().numpy()
         preds = np.argmax(probs, axis=1)
 
         # -------------------------
-        # 3. Confusion Matrix 저장
+        # 3. Save confusion matrices
         # -------------------------
         self._save_confusion_matrix(pl_module, save_dir, labels, preds)
 
         # -------------------------
-        # 4. Prediction CSV 저장
+        # 4. Save prediction CSVs
         # -------------------------
         self._save_prediction_csv(pl_module, save_dir, names, probs, labels, preds)
 
         # -------------------------
-        # 5. Attention Map 저장 (있는 경우만)
-        #    MILTrainerModule / DTFDTrainerModule 공통 지원
+        # 5. Save attention maps (if available)
+        #    Common support for MILTrainerModule / DTFDTrainerModule
         # -------------------------
-        if getattr(pl_module, "attention_func", False):
-            coords_list = [x["coords"] for x in outputs]
-            attn_list = [x["attn"] for x in outputs]
-            self._save_attention_maps(
-                pl_module, save_dir, names, coords_list, attn_list, labels, preds
-            )
+        if bool(getattr(pl_module, "attention_func", False)):
+            coords_list = [x.get("coords", None) for x in outputs]
+            attn_list = [x.get("attn", None) for x in outputs]
+            self._save_attention_maps(pl_module, save_dir, names, coords_list, attn_list, labels, preds)
 
         # -------------------------
-        # 6. 메모리 정리
+        # 6. Cleanup memory
         # -------------------------
-        pl_module.test_outputs.clear()
+        try:
+            pl_module.test_outputs.clear()
+        except Exception:
+            # might not be a list in some setups
+            setattr(pl_module, "test_outputs", [])
         gc.collect()
 
     # ----------------------------------------------------------------------
-    # 저장 경로 생성 (base_save_dir 우선)
+    # Build save directory (prefer base_save_dir)
     # ----------------------------------------------------------------------
-    def _get_save_dir(self, pl_module):
-
-        # 1) base_save_dir가 있으면 그걸 기준으로 사용
+    def _get_save_dir(self, pl_module: "pl.LightningModule") -> Path:
+        # 1) Prefer base_save_dir if provided
         base_save_dir = getattr(pl_module, "base_save_dir", None)
         if base_save_dir is not None:
             base_path = Path(base_save_dir)
-            save_dir = (
-                base_path
-                / pl_module.test_dataset_element_name
-                / f"seed_{pl_module.seed}"
-            )
+            save_dir = base_path / pl_module.test_dataset_element_name / f"seed_{pl_module.seed}"
             return save_dir
 
-        # 2) fallback: 기존 방식(args 기반)
+        # 2) Fallback: previous args-based scheme
         train_dataset_name_str = (
             "_".join(pl_module.args.train_dataset_name)
             if isinstance(pl_module.args.train_dataset_name, list)
@@ -90,7 +105,7 @@ class SaveAnalysisResultsCallback(pl.Callback):
 
         save_dir_parts = [pl_module.args.output_dir, train_dataset_name_str]
 
-        # mixup 사용 시 경로에 mixup 정보 추가
+        # Append mixup info if enabled
         if getattr(pl_module.args, "use_mixed", False):
             save_dir_parts.append(f"mixup_{pl_module.args.mixup_ratio}")
 
@@ -110,11 +125,21 @@ class SaveAnalysisResultsCallback(pl.Callback):
     # ----------------------------------------------------------------------
     # Confusion Matrix
     # ----------------------------------------------------------------------
-    def _save_confusion_matrix(self, pl_module, save_dir, labels, preds):
-        class_names = pl_module.test_class_names_list
-        cm = confusion_matrix(labels, preds, labels=range(len(class_names)))
-        cm_prob = cm / cm.sum(axis=1, keepdims=True)
-        cm_prob = np.nan_to_num(cm_prob)
+    def _save_confusion_matrix(
+        self,
+        pl_module: "pl.LightningModule",
+        save_dir: Path,
+        labels: np.ndarray,
+        preds: np.ndarray,
+    ) -> None:
+        class_names: List[str] = pl_module.test_class_names_list
+        num_classes = len(class_names)
+
+        cm = confusion_matrix(labels, preds, labels=list(range(num_classes)))
+
+        # row-normalized confusion matrix
+        row_sum = cm.sum(axis=1, keepdims=True)
+        cm_prob = np.divide(cm, row_sum, out=np.zeros_like(cm, dtype=float), where=(row_sum != 0))
 
         for matrix, suffix, fmt in [
             (cm, "confusion_matrix.jpg", "d"),
@@ -132,69 +157,93 @@ class SaveAnalysisResultsCallback(pl.Callback):
             plt.xlabel("Predicted")
             plt.ylabel("True")
             plt.title(f"Seed: {pl_module.seed}")
-            plt.savefig(save_dir / suffix, format="jpg")
+            plt.tight_layout()
+            plt.savefig(save_dir / suffix, format="jpg", dpi=200)
             plt.close()
 
     # ----------------------------------------------------------------------
     # Prediction CSV
     # ----------------------------------------------------------------------
-    def _save_prediction_csv(self, pl_module, save_dir, names, probs, labels, preds):
-        class_names = pl_module.test_class_names_list
-        predictions = []
+    def _save_prediction_csv(
+        self,
+        pl_module: "pl.LightningModule",
+        save_dir: Path,
+        names: List[str],
+        probs: np.ndarray,
+        labels: np.ndarray,
+        preds: np.ndarray,
+    ) -> None:
+        class_names: List[str] = pl_module.test_class_names_list
+        predictions: List[Dict[str, Any]] = []
 
         for name, prob_arr, label, pred in zip(names, probs, labels, preds):
-            entropy_val = scipy.stats.entropy(prob_arr).item()
-            top_two = np.sort(prob_arr)[-2:]
-            margin = round(top_two[-1] - top_two[-2], 4)
+            # entropy
+            entropy_val = float(scipy.stats.entropy(prob_arr))
 
-            row = {
+            # margin = top1 - top2
+            sorted_probs = np.sort(prob_arr)
+            top1 = float(sorted_probs[-1])
+            top2 = float(sorted_probs[-2]) if len(sorted_probs) >= 2 else 0.0
+            margin = round(top1 - top2, 4)
+
+            row: Dict[str, Any] = {
                 "Slide name": name,
-                "GT": class_names[label],
-                "Pred": class_names[pred],
+                "GT": class_names[int(label)],
+                "Pred": class_names[int(pred)],
                 "Entropy": round(entropy_val, 4),
                 "Margin": margin,
             }
-            # 클래스별 confidence
+
+            # per-class confidence
             for idx, cname in enumerate(class_names):
                 row[f"Confidence {cname}"] = f"{prob_arr[idx]:.4f}"
 
             predictions.append(row)
 
         df = pd.DataFrame(predictions)
-        df.to_csv(save_dir / "all_predictions.csv", index=False)
+        df.to_csv(save_dir / "all_predictions.csv", index=False, encoding="utf-8-sig")
 
-        # 오답만 따로 저장
+        # Save wrong predictions only
         df_wrong = df[df["GT"] != df["Pred"]]
-        df_wrong.to_csv(save_dir / "wrong_predictions.csv", index=False)
+        df_wrong.to_csv(save_dir / "wrong_predictions.csv", index=False, encoding="utf-8-sig")
 
     # ----------------------------------------------------------------------
     # Attention Maps
     # ----------------------------------------------------------------------
     def _save_attention_maps(
-        self, pl_module, save_dir, names, coords_list, attn_list, labels, preds
-    ):
+        self,
+        pl_module: "pl.LightningModule",
+        save_dir: Path,
+        names: List[str],
+        coords_list: List[Any],
+        attn_list: List[Any],
+        labels: np.ndarray,
+        preds: np.ndarray,
+    ) -> None:
         save_path = save_dir / "attention_maps"
+        save_path.mkdir(parents=True, exist_ok=True)
         print(f"[Callback] Saving {len(names)} attention maps...")
 
-        class_names = pl_module.test_class_names_list
+        class_names: List[str] = pl_module.test_class_names_list
         cnt = 0
 
-        for name, coords, attn, label, pred in zip(
-            names, coords_list, attn_list, labels, preds
-        ):
+        for name, coords, attn, label, pred in zip(names, coords_list, attn_list, labels, preds):
             if attn is None:
                 continue
 
             cnt += 1
-            label_name = class_names[label]
-            pred_name = class_names[pred]
+            label_name = class_names[int(label)]
+            pred_name = class_names[int(pred)]
 
-            # 예외처리 그대로 유지
+            # Keep the original exception handling
             if label_name == "TVA+VA":
                 label_name = "TVA"
 
-            # attn: [1, N] or [N] -> numpy
-            attn_np = attn.squeeze().numpy()
+            # convert to numpy safely: attn: [1, N] or [N] -> numpy
+            if isinstance(attn, torch.Tensor):
+                attn_np = attn.detach().squeeze().cpu().numpy()
+            else:
+                attn_np = np.asarray(attn).squeeze()
 
             save_attention_map(
                 slide_name=name,

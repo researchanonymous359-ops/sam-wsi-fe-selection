@@ -41,7 +41,7 @@ class AttentionPooling(nn.Module):
         return M  # K x D (or 1 x D if K=1)
         
     def get_attention_maps(self, x):
-        '''Dropout 없이 Attention Map 반환'''
+        '''Return Attention Map without Dropout'''
         if x.dim() == 3:
             x = x.squeeze(0)
 

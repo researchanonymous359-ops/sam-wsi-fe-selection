@@ -13,23 +13,23 @@ from sklearn.metrics import confusion_matrix, cohen_kappa_score
 
 class SaveGradingAnalysisResultsCallback(pl.Callback):
     """
-    Grading 전용 분석 콜백
-    - test_outputs에서 (probs, label, name) 수집
-    - confusion matrix 저장
-    - all_predictions / wrong_predictions 저장
-    - QWK(Quadratic Weighted Kappa) + Balanced Accuracy summary 저장
+    Analysis callback dedicated to Grading
+    - Collects (probs, label, name) from test_outputs
+    - Saves confusion matrix
+    - Saves all_predictions / wrong_predictions
+    - Saves QWK (Quadratic Weighted Kappa) + Balanced Accuracy summary
     """
 
     def on_test_epoch_end(self, trainer, pl_module):
         # -------------------------
-        # 1. 저장 경로
+        # 1. Save directory
         # -------------------------
         save_dir = self._get_save_dir(pl_module)
         save_dir.mkdir(parents=True, exist_ok=True)
         print(f"[Callback][Grading] Saving analysis results to {save_dir}")
 
         # -------------------------
-        # 2. 테스트 결과 수집
+        # 2. Collect test results
         # -------------------------
         outputs = getattr(pl_module, "test_outputs", None)
         if not outputs:
@@ -42,33 +42,33 @@ class SaveGradingAnalysisResultsCallback(pl.Callback):
         preds = np.argmax(probs, axis=1)
 
         # -------------------------
-        # 3. Confusion Matrix 저장
+        # 3. Save Confusion Matrix
         # -------------------------
         self._save_confusion_matrix(pl_module, save_dir, labels, preds)
 
         # -------------------------
-        # 4. Prediction CSV 저장
+        # 4. Save Prediction CSV
         # -------------------------
         self._save_prediction_csv(pl_module, save_dir, names, probs, labels, preds)
 
         # -------------------------
-        # 5. Summary metric 저장 (QWK + Balanced Acc)
+        # 5. Save summary metrics (QWK + Balanced Acc)
         # -------------------------
         self._save_grading_summary(pl_module, save_dir, labels, preds)
 
         # -------------------------
-        # 6. 메모리 정리
+        # 6. Memory cleanup
         # -------------------------
         pl_module.test_outputs.clear()
         gc.collect()
 
     # ----------------------------------------------------------------------
-    # 저장 경로 생성 (base_save_dir 우선)
+    # Create save directory (prioritize base_save_dir)
     # ----------------------------------------------------------------------
     def _get_save_dir(self, pl_module):
         """
-        classification callback과 동일한 규칙:
-        base_save_dir가 있으면:
+        Same rule as classification callback:
+        If base_save_dir exists:
           base_save_dir / test_dataset_element_name / seed_{seed}
         """
         base_save_dir = getattr(pl_module, "base_save_dir", None)
@@ -77,7 +77,7 @@ class SaveGradingAnalysisResultsCallback(pl.Callback):
             save_dir = base_path / pl_module.test_dataset_element_name / f"seed_{pl_module.seed}"
             return save_dir
 
-        # fallback (기존 방식)
+        # fallback (legacy method)
         train_dataset_name_str = (
             "_".join(pl_module.args.train_dataset_name)
             if isinstance(pl_module.args.train_dataset_name, list)
@@ -137,7 +137,7 @@ class SaveGradingAnalysisResultsCallback(pl.Callback):
         predictions = []
 
         for name, prob_arr, label, pred in zip(names, probs, labels, preds):
-            # 안전 정규화 (혹시 합이 1이 아닐 수 있음)
+            # Safe normalization (in case the sum is not exactly 1)
             prob_arr = prob_arr / np.clip(prob_arr.sum(), 1e-12, None)
 
             entropy_val = float(scipy.stats.entropy(prob_arr))
@@ -172,7 +172,7 @@ class SaveGradingAnalysisResultsCallback(pl.Callback):
     def _save_grading_summary(self, pl_module, save_dir, labels, preds):
         """
         - QWK: quadratic weighted kappa
-        - Balanced Acc: macro accuracy (per-class recall 평균)
+        - Balanced Acc: macro accuracy (mean per-class recall)
         """
         num_classes = len(pl_module.test_class_names_list)
 

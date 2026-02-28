@@ -286,7 +286,6 @@ class RRTMIL(nn.Module):
         super().__init__()
         self.num_classes = num_classes
 
-        # --- 고정 설정 사용 ---
         heads       = RRT_CFG["heads"]
         region_attn = RRT_CFG["region_attn"]
         region_size = RRT_CFG["region_size"]

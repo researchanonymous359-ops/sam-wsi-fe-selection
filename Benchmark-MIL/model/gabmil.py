@@ -80,7 +80,6 @@ class GABMILClassifier(nn.Module):
     def forward(self, x):
         # x: [1, N, D]
         pooled_features = self.pooling_layer(x) # [1, D] (if flatten=True)
-        # flatten은 pooling layer 내부 혹은 여기서 처리
         if pooled_features.dim() > 2:
             pooled_features = pooled_features.flatten(start_dim=1)
             

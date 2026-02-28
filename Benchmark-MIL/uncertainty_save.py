@@ -1,4 +1,4 @@
-# uncertainty_save.py (전체 교체본)
+# uncertainty_save.py
 
 import numpy as np
 from scipy.stats import entropy as shannon_entropy
@@ -15,11 +15,11 @@ from sklearn.metrics import accuracy_score
 
 def AULC(accs, uncertainties):
     """
-    accs: 0/1 (정답/오답) 1D array
-    uncertainties: 1D array (낮을수록 확실)
+    accs: 0/1 (correct/incorrect) 1D array
+    uncertainties: 1D array (lower means more certain)
     """
     idxs = np.argsort(uncertainties)
-    error_s = accs[idxs]  # 여기 accs는 0/1(정답)인데 아래에서 error로 쓰고 있어 기존 구현을 유지
+    error_s = accs[idxs]  # Here accs is 0/1 (correct), but used as error below; keeping the existing implementation
     mean_error = error_s.mean() if len(error_s) else 0.0
     if mean_error == 0.0:
         return 0.0, np.array([])
@@ -34,7 +34,7 @@ def rAULC(uncertainties, accs_bool):
     accs_bool: (GT==Pred) -> True/False
     """
     accs = accs_bool.astype("float")
-    perf_aulc, _ = AULC(accs, -accs)  # 이상적 불확실성: 정답이면 낮음(=불확실성 낮음)
+    perf_aulc, _ = AULC(accs, -accs)  # Ideal uncertainty: lower if correct (= low uncertainty)
     curr_aulc, _ = AULC(accs, uncertainties)
     if perf_aulc == 0.0:
         return np.nan
@@ -43,19 +43,19 @@ def rAULC(uncertainties, accs_bool):
 
 def _infer_class_cols(df: pd.DataFrame):
     """
-    'Confidence XXX' 컬럼을 자동 탐색해 (클래스명 리스트, 열 리스트) 반환
+    Automatically search for 'Confidence XXX' columns and return (list of class names, list of columns)
     """
     conf_cols = [c for c in df.columns if c.startswith("Confidence ")]
     if not conf_cols:
         raise ValueError("No 'Confidence *' columns found in prediction CSV.")
-    # 클래스명은 'Confidence ' 이후
+    # Class name is everything after 'Confidence '
     class_names = [c[len("Confidence "):] for c in conf_cols]
     return class_names, conf_cols
 
 
 def _ensure_uncertainty(df: pd.DataFrame, conf_cols):
     """
-    df에 'Uncertainty' 없으면 Shannon entropy로 생성
+    Generate 'Uncertainty' using Shannon entropy if it doesn't exist in df
     """
     if "Uncertainty" in df.columns:
         return df
@@ -68,13 +68,13 @@ def _ensure_uncertainty(df: pd.DataFrame, conf_cols):
 
 def _map_labels(df: pd.DataFrame, class_names):
     """
-    GT/Pred 문자열을 class_names 인덱스로 매핑
+    Map GT/Pred strings to class_names indices
     """
     name_to_idx = {n: i for i, n in enumerate(class_names)}
     df = df.copy()
     df["GT"] = df["GT"].map(name_to_idx)
     df["Pred"] = df["Pred"].map(name_to_idx)
-    # 매핑 실패가 있으면 드롭
+    # Drop rows with mapping failures
     df = df.dropna(subset=["GT", "Pred"]).reset_index(drop=True)
     df["GT"] = df["GT"].astype(int)
     df["Pred"] = df["Pred"].astype(int)
@@ -83,7 +83,7 @@ def _map_labels(df: pd.DataFrame, class_names):
 
 def _multiclass_auroc_safe(y_probs_np, y_true_np, num_classes: int):
     """
-    torchmetrics.multiclass_auroc 사용. 빈배열/한 클래스만 존재시 NaN 반환.
+    Uses torchmetrics.multiclass_auroc. Returns NaN if the array is empty or only one class exists.
     """
     if len(y_true_np) == 0:
         return np.nan
@@ -99,8 +99,8 @@ def _multiclass_auroc_safe(y_probs_np, y_true_np, num_classes: int):
 
 def _slice_by_quantile(df: pd.DataFrame, q: float):
     """
-    'Uncertainty' 기준으로 q 분위수 이하만 남김 (q in [0,1]).
-    비어있으면 None 반환.
+    Keep only rows below the q-th quantile based on 'Uncertainty' (q in [0,1]). 
+    Return None if empty.
     """
     if len(df) == 0:
         return None
@@ -113,19 +113,19 @@ def _slice_by_quantile(df: pd.DataFrame, q: float):
 
 def final_uncertainty_save(dir_path, seeds, dataset, label_type, bins=30):
     """
-    dir_path: 저장 폴더 (seed_* 하위에 all_predictions.csv, 최상위에 ensemble_all_predictions.csv 기대)
-    seeds: 리스트 (예: [20,40])
-    dataset/label_type: 기존 시그니처 유지(로직에서 동적 처리)
+    dir_path: Save folder (expects all_predictions.csv under seed_*, and ensemble_all_predictions.csv at the top level)
+    seeds: List (e.g., [20, 40])
+    dataset/label_type: Keep existing signature (handled dynamically in logic)
     """
     dir_path = Path(dir_path)
 
-    # 수집 벡터
+    # Collection vectors
     test_size_fracs = [round(1 - 0.05 * i, 2) for i in range(11)]  # 1.00, 0.95, ..., 0.50
     seed_col, size_col = [], []
     acc_col, auc_col, ece_col, ment_col, raulc_col = [], [], [], [], []
 
     # -----------------------
-    # per-seed 루프
+    # per-seed loop
     # -----------------------
     for seed in seeds:
         csv_path = dir_path / f"seed_{seed}" / "all_predictions.csv"
@@ -134,19 +134,19 @@ def final_uncertainty_save(dir_path, seeds, dataset, label_type, bins=30):
             continue
 
         df_full = pd.read_csv(csv_path)
-        # 클래스/열 파악
+        # Identify classes/columns
         class_names, conf_cols = _infer_class_cols(df_full)
         num_classes = len(class_names)
-        # Uncertainty 생성
+        # Generate Uncertainty
         df_full = _ensure_uncertainty(df_full, conf_cols)
-        # 라벨 매핑
+        # Label mapping
         df_full, _ = _map_labels(df_full, class_names)
 
-        # 모든 p에 대해 슬라이싱 & 메트릭
+        # Slicing & metrics for all p
         for p in test_size_fracs:
             df = _slice_by_quantile(df_full, p)
             if df is None:
-                # 비어있으면 스킵
+                # Skip if empty
                 continue
 
             y_probs = df[conf_cols].to_numpy(dtype=float)
@@ -154,7 +154,7 @@ def final_uncertainty_save(dir_path, seeds, dataset, label_type, bins=30):
             y_true = df["GT"].to_numpy(dtype=int)
             y_pred = df["Pred"].to_numpy(dtype=int)
 
-            # 메트릭
+            # Metrics
             seed_col.append(seed)
             size_col.append(int(round(p * 100)))
 
@@ -169,7 +169,7 @@ def final_uncertainty_save(dir_path, seeds, dataset, label_type, bins=30):
             raulc_col.append(round(float(rAULC(df["Uncertainty"].to_numpy(), (y_true == y_pred))), 2))
 
     # -----------------------
-    # 각 p별 평균행 (Average)
+    # Average row per p
     # -----------------------
     for p in test_size_fracs:
         p_pct = int(round(p * 100))
@@ -199,7 +199,7 @@ def final_uncertainty_save(dir_path, seeds, dataset, label_type, bins=30):
         raulc_col.append(_avgstd_str(raulc_vals, ":.2f"))
 
     # -----------------------
-    # Ensemble (최상위 CSV)
+    # Ensemble (Top-level CSV)
     # -----------------------
     ens_path = dir_path / "ensemble_all_predictions.csv"
     if ens_path.exists():
@@ -235,7 +235,7 @@ def final_uncertainty_save(dir_path, seeds, dataset, label_type, bins=30):
         print(f"[WARN] Ensemble CSV not found: {ens_path}")
 
     # -----------------------
-    # 저장
+    # Save
     # -----------------------
     out = pd.DataFrame({
         "SEED": seed_col,

@@ -11,7 +11,7 @@ from utils import get_cam_1d
 
 def get_forward_func(mil_model):
     """
-    모델 이름에 따라 공통 forward 함수를 반환.
+    Returns a common forward function based on the model name.
     """
     if mil_model in ["meanpooling", "maxpooling", "ABMIL", "GABMIL"]:
         return general_forward
@@ -30,7 +30,7 @@ def get_forward_func(mil_model):
 
 
 # -----------------------------
-# 공통 forward 함수들
+# Common forward functions
 # -----------------------------
 
 def general_forward(data, classifier, loss_func, num_classes, label=None):
@@ -48,7 +48,7 @@ def dsmil_forward(data, classifier, loss_func, num_classes, label=None):
 
     loss = None
     if label is not None:
-        # label shape check
+        # Check label shape
         if label.ndim == 1:
             lbl = label
         else:
@@ -77,7 +77,7 @@ def clam_forward(data, classifier, loss_func, num_classes, label=None):
 
 
 def transmil_forward(data, classifier, loss_func, num_classes, label=None):
-    # TransMIL, Transformer 등은 (logits, prob, Y_hat) 반환
+    # TransMIL, Transformer, etc. return (logits, prob, Y_hat)
     res = classifier(data)
     if isinstance(res, tuple):
         logits = res[0]
@@ -93,7 +93,7 @@ def transmil_forward(data, classifier, loss_func, num_classes, label=None):
 
 
 def wikg_forward(data, classifier, loss_func, num_classes, label=None):
-    # 🔥 [수정] WiKG 반환값 (logits, y_prob, y_hat) 처리
+    # 🔥 [Modified] Handle WiKG return values (logits, y_prob, y_hat)
     res = classifier(data)
     if isinstance(res, tuple):
         logits = res[0]
@@ -143,7 +143,7 @@ def dtfdmil_forward_1st_tier(
             data, dim=0, index=torch.LongTensor(tindex).to(data.device)
         )
 
-        # 임베딩 & attention
+        # Embedding & attention
         tmidFeat = dimReduction(subFeat_tensor)
         
         # Tuple Unpacking: (logits, attention_score)
@@ -153,15 +153,15 @@ def dtfdmil_forward_1st_tier(
         tAA_all.append(tAA)
         patch_indices.append(tindex)
 
-        # attention 가중합
+        # Weighted sum of attention
         tattFeats = torch.einsum("ns,n->ns", tmidFeat, tAA)
 
-        # bag-level feature
+        # Bag-level feature
         tattFeat_tensor = torch.sum(tattFeats, dim=0).unsqueeze(0)  # [1, D]
         tPredict = classifier(tattFeat_tensor)
         slide_sub_preds.append(tPredict)
 
-        # CAM 기반 top-k / bottom-k 패치 선택
+        # CAM-based top-k / bottom-k patch selection
         patch_pred_logits = get_cam_1d(classifier, tattFeats.unsqueeze(0)).squeeze(0)
         patch_pred_logits = torch.transpose(patch_pred_logits, 0, 1)
         patch_pred_softmax = torch.softmax(patch_pred_logits, dim=1)

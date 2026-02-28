@@ -2,17 +2,19 @@
 import torch
 from collections import defaultdict
 
-# Lion은 외부 라이브러리 사용 (pip install lion-pytorch 필요)
+# Lion uses an external library (requires: pip install lion-pytorch)
 try:
     from lion_pytorch import Lion
 except ImportError:
     Lion = None
 
+
 class Lookahead(torch.optim.Optimizer):
     """
-    PyTorch Lightning 호환성을 위해 zero_grad(set_to_none=True)를 지원하는
-    수정된 Lookahead 구현체입니다.
+    A modified Lookahead optimizer implementation that supports
+    zero_grad(set_to_none=True) for PyTorch Lightning compatibility.
     """
+
     def __init__(self, optimizer, k=5, alpha=0.5):
         self.optimizer = optimizer
         self.k = k
@@ -54,7 +56,7 @@ class Lookahead(torch.optim.Optimizer):
     def load_state_dict(self, state_dict):
         self.optimizer.load_state_dict(state_dict)
 
-    # ★ 핵심 수정: set_to_none 인자를 받아서 내부 optimizer로 전달 (에러 해결의 열쇠)
+    # Key modification: accept set_to_none and pass it to the inner optimizer (prevents Lightning errors)
     def zero_grad(self, set_to_none: bool = False):
         self.optimizer.zero_grad(set_to_none=set_to_none)
 

@@ -1,10 +1,4 @@
 # model/ilra.py
-"""
-ILRA: Exploring Low-Rank Property in MIL for WSI Classification (ICLR 2023)
-- 깃허브 프레임워크 스타일에 맞춰 경량/고정 하이퍼파라미터 버전
-- forward(...) -> (logits, y_prob, y_hat)
-- get_attention_maps(...) 지원: (logits, y_prob, y_hat, attn)
-"""
 
 import math
 import torch
@@ -17,7 +11,7 @@ import torch.nn.functional as F
 # ---------------------------
 class MultiHeadAttention(nn.Module):
     """
-    Q: (B, SQ, Dq), K: (B, SK, Dk) -> output: (B, SQ, Dv), attn: (B, heads, SQ, SK) 평균 후 (B, SQ, SK)
+    Q: (B, SQ, Dq), K: (B, SK, Dk) -> output: (B, SQ, Dv), attn: (B, heads, SQ, SK) after averaging (B, SQ, SK)
     """
     def __init__(self, dim_Q, dim_K, dim_V, num_heads, ln: bool = False, gated: bool = False):
         super().__init__()
@@ -65,14 +59,14 @@ class MultiHeadAttention(nn.Module):
         if self.ln1 is not None:
             out = self.ln1(out)
 
-        # gated residual (원문 구현에 맞춤)
+        # gated residual (matches the original paper implementation)
         if self.gate is not None:
             out = out * self.gate(Q0)
 
         attn_simple = None
         if return_attention and attn is not None:
-            # attn: (B * heads?) 또는 (B, SQ, SK) 프레임워크 버전에 따라 다름
-            # PyTorch 2.x의 average_attn_weights=True면 (B, SQ, SK) 반환
+            # attn: (B * heads?) or (B, SQ, SK) depending on the framework version
+            # If PyTorch 2.x and average_attn_weights=True, returns (B, SQ, SK)
             attn_simple = attn  # (B, SQ, SK)
 
         return out, attn_simple
@@ -83,7 +77,7 @@ class MultiHeadAttention(nn.Module):
 # ---------------------------
 class GAB(nn.Module):
     """
-    Low-rank latent (num_inds x dim_out)로 X를 압축 후 복원 (proxy self-attention)
+    Compresses X into a low-rank latent (num_inds x dim_out) and restores it (proxy self-attention)
     """
     def __init__(self, dim_in, dim_out, num_heads, num_inds, ln: bool = True):
         super().__init__()
@@ -109,7 +103,7 @@ class GAB(nn.Module):
 # ---------------------------
 class NLP(nn.Module):
     """
-    Global token S (1,1,D)와 cross-attention → slide-level embedding
+    Cross-attention with global token S (1,1,D) → slide-level embedding
     """
     def __init__(self, dim, num_heads, ln: bool = True):
         super().__init__()
@@ -122,20 +116,20 @@ class NLP(nn.Module):
         S = self.S.repeat(B, 1, 1)                           # (B, 1, D)
         out, attn = self.mha(S, X, return_attention=return_attention)  # out: (B,1,D), attn: (B,1,N)
         if return_attention and attn is not None:
-            # 최종 어텐션 맵: (B, N)
-            attn_vec = attn.sum(dim=1)  # 여기선 SQ=1 이므로 동일
+            # Final attention map: (B, N)
+            attn_vec = attn.sum(dim=1)  # SQ=1 here, so it is the same
         else:
             attn_vec = None
         return out, attn_vec
 
 
 # ---------------------------
-# ILRA (고정 하이퍼파라미터)
+# ILRA (Fixed hyperparameters)
 # ---------------------------
 class ILRA(nn.Module):
     """
-    입력: feats (N,C) or (B,N,C)
-    출력: (logits, y_prob, y_hat)
+    Input: feats (N,C) or (B,N,C)
+    Output: (logits, y_prob, y_hat)
     get_attention_maps: (logits, y_prob, y_hat, attn[N])
     """
     def __init__(
@@ -153,7 +147,7 @@ class ILRA(nn.Module):
         self.n_classes = n_classes
         self.input_size = input_size
 
-        # GAB blocks (첫 블록은 dim_in=input_size → embed_dim)
+        # GAB blocks (First block dim_in=input_size → embed_dim)
         blocks = []
         for i in range(num_layers):
             blocks.append(
@@ -190,7 +184,7 @@ class ILRA(nn.Module):
 
     def forward(self, feats: torch.Tensor, caption=None, subsite=None):
         """
-        (caption, subsite) 입력은 무시 (ILRA 원논문 구현에 없음)
+        Ignores (caption, subsite) inputs (not in the original ILRA paper implementation)
         """
         if feats.dim() == 2:
             feats = feats.unsqueeze(0)  # (1,N,C)
@@ -220,7 +214,7 @@ class ILRA(nn.Module):
         y_prob = F.softmax(logits, dim=1)
         y_hat = torch.argmax(y_prob, dim=1)
 
-        # 배치 1 가정 (프레임워크가 bag 단위로 돌림)
+        # Assumes batch size 1 (framework runs per bag)
         if attn is not None and attn.dim() == 2 and attn.size(0) == 1:
             attn = attn[0]
         return logits, y_prob, y_hat, attn

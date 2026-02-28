@@ -6,6 +6,7 @@ import torch.nn.functional as F
 # Public API
 # =========================================================
 def get_forward_func_grading(mil_model: str):
+    """Return the grading forward function for the given MIL model name."""
     if mil_model in ["meanpooling", "maxpooling", "ABMIL", "GABMIL"]:
         return general_forward_grading
     elif mil_model == "DSMIL":
@@ -23,6 +24,7 @@ def get_forward_func_grading(mil_model: str):
 
 
 def get_attention_func_grading(mil_model: str):
+    """Return the grading attention function for the given MIL model name (if supported)."""
     if mil_model in ["ABMIL", "GABMIL"]:
         return general_attention_func_grading
     elif mil_model in ["TransMIL", "Transformer", "ILRA"]:
@@ -44,9 +46,9 @@ def get_attention_func_grading(mil_model: str):
 # =========================================================
 def _get_alpha_power_from_args(args, default_alpha=1.0, default_power=2.0):
     """
-    priority:
-      1) args.grading_alpha / args.grading_power (forward_fn 표준)
-      2) args.grading_cost_lambda + (cost_type, cost_gamma) (option.py 표준)
+    Priority:
+      1) args.grading_alpha / args.grading_power (forward_fn convention)
+      2) args.grading_cost_lambda + (cost_type, cost_gamma) (option.py convention)
     """
     alpha = default_alpha
     power = default_power
@@ -95,11 +97,11 @@ def grading_cost_sensitive_ce(
     idx = torch.arange(num_classes, device=logits.device, dtype=prob.dtype).view(1, -1)
     y = target.view(-1, 1).to(prob.dtype)
 
-    dist = torch.abs(idx - y) ** float(power)  # (B,K)
+    dist = torch.abs(idx - y) ** float(power)  # (B, K)
     penalty = torch.sum(prob * dist, dim=1)    # (B,)
 
     if normalize:
-        # scale penalty to have mean ~ 1 (stabilize across K/power)
+        # Scale penalty to have mean ~ 1 (stabilize across K/power)
         denom = penalty.detach().mean().clamp_min(float(eps))
         penalty = penalty / denom
 
@@ -119,6 +121,7 @@ def _compute_grading_loss(
     loss_func,
     args=None,
 ):
+    """Compute grading loss according to args.grading_loss configuration."""
     if label is None:
         return None
 
@@ -130,7 +133,7 @@ def _compute_grading_loss(
 
     grading_loss_type = (getattr(args, "grading_loss", "ce") if args is not None else "ce").lower()
 
-    # loss_func 없으면 기본 CE로 fallback
+    # If loss_func is None, fallback to default CE
     if loss_func is None:
         loss_func = lambda lg, yy: F.cross_entropy(lg, yy)
 
@@ -157,6 +160,7 @@ def _compute_grading_loss(
 
 
 def _ensure_2d(x: torch.Tensor) -> torch.Tensor:
+    """Ensure the tensor is 2D (prepend batch dim if needed)."""
     return x.unsqueeze(0) if x.ndim == 1 else x
 
 

@@ -10,11 +10,11 @@ import h5py
 import pickle
 
 # ===============================
-# 이름 정규화 & 공용 유틸
+# Name Normalization & Common Utils
 # ===============================
 def normalize_dataset_name(name: str) -> str:
     """
-    다양한 별칭/소문자 입력을 정규화
+    Normalize various alias/lowercase inputs
     """
     key = name.strip().lower().replace("-", "_")
     alias = {
@@ -27,12 +27,12 @@ def normalize_dataset_name(name: str) -> str:
         "bracs": "bracs",
         "bracs_wsi": "bracs",
 
-        # 🔥 TCGA 계열
+        # 🔥 TCGA series
         "tcga_nsclc": "TCGA-NSCLC",
         "tcga_rcc": "TCGA-RCC",
         "tcga_glioma": "TCGA-GLIOMA",
 
-        # 🔥 HISAI SKIN 계열
+        # 🔥 HISAI SKIN series
         "histai_skin_b1": "histai-skin-b1",
         "histai_skin": "histai-skin-b1",
         "histai_skin1": "histai-skin-b1",
@@ -120,7 +120,7 @@ def try_resolve_alt_res(
 
 
 # ===============================
-# Base: 공통 Dataset 부모 클래스
+# Base: Common Dataset Parent Class
 # ===============================
 class _BaseWSIDataset(Dataset):
     def __init__(
@@ -139,10 +139,10 @@ class _BaseWSIDataset(Dataset):
         self.data_split = data_split
         self.feature_extractor = feature_extractor
 
-        # 🔥 Sampler용 라벨 캐시
+        # 🔥 Label cache for Sampler
         self.labels: List[int] = []
 
-        # 해상도 정렬 (내림차순)
+        # Sort resolutions (descending)
         self.resolutions = sorted(resolutions, key=lambda x: int(x[1:]), reverse=True)
         self.resolution_values = [int(res[1:]) for res in self.resolutions]
         self.highest_res = self.resolutions[0]
@@ -154,7 +154,7 @@ class _BaseWSIDataset(Dataset):
 
 
 # ===============================
-# Dataset: 3D_certain / Leica (PKL 로더)
+# Dataset: 3D_certain / Leica (PKL Loader)
 # ===============================
 class ThreeDCertainWSIDataset(_BaseWSIDataset):
     def __init__(self, *args, **kwargs):
@@ -290,16 +290,16 @@ class LeicaCertainWSIDataset(ThreeDCertainWSIDataset):
 
 
 # ===============================
-# Generic H5 Dataset (H5 로더 통합 최적화)
+# Generic H5 Dataset (Unified H5 Loader Optimization)
 # ===============================
 class _BaseH5WSIDataset(_BaseWSIDataset):
     """
-    Camelyon16, BRACS, TCGA, HISAI-SKIN, PANDA, UBC-OCEAN, CPTAC 등 H5 기반 데이터셋 공통 부모 클래스.
+    Common parent class for H5-based datasets like Camelyon16, BRACS, TCGA, HISAI-SKIN, PANDA, UBC-OCEAN, CPTAC, etc.
 
-    ✅ CPTAC처럼 다음 형태도 지원:
+    ✅ Supports the following format like CPTAC:
       .../<FE>/<res>/<split>/<class>/<slide_id>/<uuid>.h5
-    즉, class 폴더 바로 아래가 아니라 더 깊게 .h5가 있어도 로딩 가능하도록
-    self.data에 '실제 h5 경로(Path)'를 저장하는 구조로 변경.
+    That is, changed to a structure that stores the 'actual h5 path (Path)' in self.data, 
+    allowing loading even if the .h5 file is nested deeper than directly under the class folder.
     """
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -316,7 +316,7 @@ class _BaseH5WSIDataset(_BaseWSIDataset):
 
     def _pick_existing_base(self, data_element_name: str) -> Optional[Path]:
         """
-        데이터셋마다 경로에 patch_size가 포함되거나 포함되지 않을 수 있어서 둘 다 시도.
+        Since the path may or may not include patch_size depending on the dataset, try both.
         """
         base_with_ps = Path(
             f"{self.dataset_root}/{data_element_name}/{self.feature_extractor}/{self.highest_res}/{self.patch_size}/{self.data_split}"
@@ -358,13 +358,13 @@ class _BaseH5WSIDataset(_BaseWSIDataset):
 
                 class_key = class_dir.name
 
-                # 폴더명이 숫자(0,1,2,...) 또는 문자열(G1,G2,...) 모두 대응
+                # Handles both numeric folder names (0,1,2,...) and string names (G1,G2,...)
                 if class_key.isdigit():
                     lbl = int(class_key)
                 else:
                     lbl = mapping.get(class_key, -1)
 
-                # ✅ 핵심: 깊은 폴더 구조까지 모두 스캔
+                # ✅ Core: Scan all deep folder structures
                 h5_files = sorted(class_dir.glob("**/*.h5"))
                 if len(h5_files) == 0:
                     continue
@@ -404,7 +404,7 @@ class _BaseH5WSIDataset(_BaseWSIDataset):
         feats_high, coords_high = self._load_h5_features(h5_path, require_coords=need_coords)
         feat_list = [feats_high]
 
-        # 멀티 해상도 병합: 동일한 상대경로를 가정하고 res 부분만 치환
+        # Multi-resolution merge: Assume identical relative path and replace only the res part
         for res in self.resolutions[1:]:
             alt_path_str = str(h5_path).replace(f"/{self.highest_res}/", f"/{res}/")
             alt_path = Path(alt_path_str)
@@ -417,7 +417,7 @@ class _BaseH5WSIDataset(_BaseWSIDataset):
         feat_mat = np.concatenate(feat_list, axis=1) if len(feat_list) > 1 else feats_high
         slide_features_tensor = torch.from_numpy(feat_mat).float()
 
-        # ✅ slide_name은 기본적으로 uuid stem. (원하면 parent 폴더 포함하도록 커스텀 가능)
+        # ✅ slide_name is basically the uuid stem. (Can be customized to include the parent folder if desired)
         slide_name = h5_path.stem
 
         cls_list = self.dataset_info[data_element_name]["class_names_list"]
@@ -441,7 +441,7 @@ class _BaseH5WSIDataset(_BaseWSIDataset):
 
 
 # ===============================
-# 구체적인 H5 Dataset 클래스들 (Base 상속)
+# Specific H5 Dataset Classes (Inheriting from Base)
 # ===============================
 class Camelyon16WSIDataset(_BaseH5WSIDataset): pass
 class BRACSWSIDataset(_BaseH5WSIDataset): pass
@@ -487,7 +487,7 @@ class CombinedPatchFeaturesWSIDataModule(pl.LightningDataModule):
         self.sampler_power: float = 1.0
         self._train_sample_weights: Optional[torch.Tensor] = None
 
-        # Info Dictionaries 초기화
+        # Initialize Info Dictionaries
         self.train_camelyon16_info = {}
         self.val_camelyon16_info = {}
         self.test_camelyon16_info = {}
@@ -566,7 +566,7 @@ class CombinedPatchFeaturesWSIDataModule(pl.LightningDataModule):
         _init_info("cptac_hnscc", self.train_cptac_hnscc_info, self.val_cptac_hnscc_info, self.test_cptac_hnscc_info)
         _init_info("cptac_ucec", self.train_cptac_ucec_info, self.val_cptac_ucec_info, self.test_cptac_ucec_info)
 
-        # Class Names 설정
+        # Set Class Names
         for name in self.train_dataset_name:
             cls_list = get_class_names(name)
 
@@ -622,8 +622,8 @@ class CombinedPatchFeaturesWSIDataModule(pl.LightningDataModule):
             return
 
         print(
-            f"[Sampler] WeightedRandomSampler 활성화: "
-            f"데이터셋 길이={len(self.train_dataset)}, sampler_power={self.sampler_power}"
+            f"[Sampler] WeightedRandomSampler activated: "
+            f"Dataset length={len(self.train_dataset)}, sampler_power={self.sampler_power}"
         )
 
         all_labels = []
@@ -796,4 +796,3 @@ class CombinedPatchFeaturesWSIDataModule(pl.LightningDataModule):
         if self.num_workers > 0:
             loader_kwargs["prefetch_factor"] = 1
         return DataLoader(self.test_dataset, **loader_kwargs)
-

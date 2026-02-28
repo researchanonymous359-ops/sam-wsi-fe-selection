@@ -1,29 +1,20 @@
 # pl_model/mil_trainer_dtfdmil_grading.py
-import torch
-import torch.nn.functional as F
-import pytorch_lightning as pl
 import random
 
+import pytorch_lightning as pl
+import torch
+import torch.nn.functional as F
 from torchmetrics.classification import (
     MulticlassAccuracy,
     MulticlassCalibrationError,
     MulticlassCohenKappa,
 )
 
-from pl_model.optimizers import Lookahead, Lion
 from pl_model.forward_fn import dtfdmil_forward_1st_tier, dtfdmil_forward_2nd_tier
+from pl_model.optimizers import Lookahead, Lion
 
 
 class DTFDGradingTrainerModule(pl.LightningModule):
-    """
-    DTFD-MIL Grading 전용 Trainer
-
-    ✅ 핵심 목표
-    - validation monitor: QWK/val (0~1 스케일)
-    - main.py EarlyStopping/Checkpoint에서 QWK/val을 monitor 가능하게 "반드시" 로깅
-    - checkpoint filename format에서 val_qwk 사용 가능하게 "val_qwk"도 로깅
-    - save_metrics_grading / callback 호환: y_prob_list/label_list/names/test_outputs 유지
-    """
 
     def __init__(
         self,
@@ -34,7 +25,7 @@ class DTFDGradingTrainerModule(pl.LightningModule):
         resolution_str,
         classifier_list,
         loss_func_list,
-        metrics,  # main.py에서 넘기는 기본 metric collection (acc/f1 등)
+        metrics,  # metric collection passed from main.py (acc/f1/etc.)
         patch_path=None,
     ):
         super().__init__()
@@ -48,6 +39,7 @@ class DTFDGradingTrainerModule(pl.LightningModule):
 
         self.base_save_dir = getattr(self.args, "base_save_dir", None)
 
+        # Dataset-specific label override (data1 + 8-class label types)
         if "data1" in self.test_dataset_element_name:
             if getattr(self.args, "label_type", "") in ["label1_8_class", "label2_8_probs"]:
                 self.test_class_names_list = ["HP", "IP", "LP", "SSL", "TA", "TSA", "TVA+VA", "Other"]
@@ -57,16 +49,16 @@ class DTFDGradingTrainerModule(pl.LightningModule):
         self.num_classes = len(self.test_class_names_list)
         self.resolution_str = resolution_str
 
-        # DTFD-MIL Manual Optimization
+        # DTFD-MIL uses manual optimization
         self.automatic_optimization = False
 
-        # classifier_list 분해
+        # Unpack classifier_list
         self.classifier = classifier_list[0]
         self.attention = classifier_list[1]
         self.dimReduction = classifier_list[2]
         self.UClassifier = classifier_list[3]
 
-        # Loss 함수
+        # Loss functions
         self.loss_func0 = loss_func_list[0]
         self.loss_func1 = loss_func_list[1]
 
@@ -75,10 +67,10 @@ class DTFDGradingTrainerModule(pl.LightningModule):
         # -------------------------
         # Metrics
         # -------------------------
-        # train: main.py에서 주는 metrics를 그대로 사용 (acc/f1/pre/rec 등)
+        # Train: reuse the provided metric collection (acc/f1/precision/recall/etc.)
         self.train_metrics = metrics.clone(prefix="train/")
 
-        # val/test: QWK는 pred_idx(int) vs label_idx(int)로 update하는 게 안전
+        # Val/Test: for QWK it is safer to update with pred_idx(int) vs label_idx(int)
         self.val_acc_metric = MulticlassAccuracy(num_classes=self.num_classes, average="micro")
         self.val_bacc_metric = MulticlassAccuracy(num_classes=self.num_classes, average="macro")
         self.val_qwk_metric = MulticlassCohenKappa(num_classes=self.num_classes, weights="quadratic")
@@ -90,23 +82,24 @@ class DTFDGradingTrainerModule(pl.LightningModule):
             num_classes=self.num_classes, n_bins=int(getattr(args, "n_bins", 15))
         )
 
-        # Callback 분석용 버퍼
+        # Buffer for analysis callback
         self.test_outputs = []
 
-        # save_metrics_grading.py 호환 버퍼
+        # Buffers for save_metrics_grading.py compatibility
         self.y_prob_list = []
         self.label_list = []
         self.names = []
         self.logits = None
         self.labels = None
 
-        # Patch Drop
+        # Patch drop config
         self.mil_patch_drop_min = float(getattr(self.args, "mil_patch_drop_min", 0.0))
         self.mil_patch_drop_max = float(getattr(self.args, "mil_patch_drop_max", 0.0))
         self._use_patch_drop = self.mil_patch_drop_max > 0.0
 
-        # attention 사용 여부
+        # Whether attention is enabled
         self.attention_func = bool(getattr(self.args, "attention", False))
+
         # -------------------------
         # Debug flags
         # -------------------------
@@ -126,15 +119,15 @@ class DTFDGradingTrainerModule(pl.LightningModule):
             )
 
     # ---------------------------------------------------------
-    # ✅ 핵심: DTFD 2nd-tier logits가 (G,C)로 나와도
-    #         metric 업데이트 전에 항상 (1,C) slide-level로 통일
+    # Core: unify 2nd-tier logits to slide-level (1, C) before metric updates
     # ---------------------------------------------------------
     def _to_slide_logits(self, Y_logits: torch.Tensor) -> torch.Tensor:
         """
-        - (C,)      -> (1,C)
-        - (1,C)     -> (1,C)
-        - (G,C)     -> (1,C) by mean over G
-        - 기타 unexpected shape는 에러로 잡아준다.
+        Convert logits to slide-level shape (1, C):
+        - (C,)      -> (1, C)
+        - (1, C)    -> (1, C)
+        - (G, C)    -> (1, C) by mean over G
+        - (1, G, C) -> (1, C) by mean over G (defensive)
         """
         if Y_logits is None:
             raise ValueError("Y_logits is None")
@@ -147,14 +140,14 @@ class DTFDGradingTrainerModule(pl.LightningModule):
                 return Y_logits.mean(dim=0, keepdim=True)
             return Y_logits
 
-        # 혹시 (1,G,C) 같은 형태가 들어오면 방어적으로 처리
+        # Defensive handling for unexpected shapes such as (1, G, C)
         if Y_logits.dim() == 3 and Y_logits.size(0) == 1:
             return Y_logits.mean(dim=1)
 
         raise ValueError(f"Unexpected Y_logits shape: {tuple(Y_logits.shape)}")
 
     # -----------------------------
-    # patch-drop
+    # Patch-drop
     # -----------------------------
     def _random_patch_subsample(self, feats: torch.Tensor) -> torch.Tensor:
         if feats.dim() != 2 or feats.size(0) <= 1:
@@ -177,7 +170,7 @@ class DTFDGradingTrainerModule(pl.LightningModule):
         return feats[idx]
 
     # -----------------------------
-    # forward (DTFD 1st/2nd tier)
+    # Forward (DTFD 1st/2nd tier)
     # -----------------------------
     def forward(self, feats, label=None, train: bool = False, get_attention: bool = False):
         if get_attention:
@@ -221,7 +214,7 @@ class DTFDGradingTrainerModule(pl.LightningModule):
         return loss0, loss1, gSlideLogits
 
     # -----------------------------
-    # training
+    # Training
     # -----------------------------
     def training_step(self, batch, batch_idx):
         name, coords, feats, label = batch
@@ -230,7 +223,7 @@ class DTFDGradingTrainerModule(pl.LightningModule):
         if self._use_patch_drop:
             feats = self._random_patch_subsample(feats)
 
-        # label 정리
+        # Normalize label shape
         if isinstance(label, torch.Tensor) and label.ndim == 3:
             label = label.squeeze(0)
 
@@ -239,7 +232,7 @@ class DTFDGradingTrainerModule(pl.LightningModule):
             label_idx = torch.argmax(label, dim=1)  # (1,)
         else:
             loss0, loss1, Y_logits = self.forward(feats, label.long(), train=True)
-            label_idx = label.view(-1).long()       # ✅ (1,)로 통일
+            label_idx = label.view(-1).long()       # unify to (1,)
 
         optimizer0, optimizer1 = self.optimizers()
 
@@ -251,7 +244,7 @@ class DTFDGradingTrainerModule(pl.LightningModule):
 
         total_loss = loss0 + loss1
 
-        # ✅ slide-level logits로 통일해서 metric 업데이트 (shape mismatch 방지)
+        # Unify to slide-level logits before metric update (avoid shape mismatch)
         Y_logits_slide = self._to_slide_logits(Y_logits)
         self.train_metrics.update(Y_logits_slide.detach(), label_idx)
 
@@ -278,7 +271,7 @@ class DTFDGradingTrainerModule(pl.LightningModule):
         return total_loss
 
     def on_train_epoch_end(self):
-        # schedulers step
+        # Step schedulers
         sch0, sch1 = self.lr_schedulers()
         sch0.step()
         sch1.step()
@@ -287,7 +280,7 @@ class DTFDGradingTrainerModule(pl.LightningModule):
         self.train_metrics.reset()
 
     # -----------------------------
-    # validation
+    # Validation
     # -----------------------------
     def validation_step(self, batch, batch_idx):
         name, coords, feats, label = batch
@@ -301,14 +294,14 @@ class DTFDGradingTrainerModule(pl.LightningModule):
             label_idx = torch.argmax(label, dim=1)  # (1,)
         else:
             loss0, loss1, Y_logits = self.forward(feats, label.long(), train=False)
-            label_idx = label.view(-1).long()       # ✅ (1,)로 통일
+            label_idx = label.view(-1).long()       # unify to (1,)
 
         total_loss = loss0 + loss1
 
-        # ✅ (G,C) -> (1,C)로 통일
+        # Unify (G, C) -> (1, C)
         Y_logits_slide = self._to_slide_logits(Y_logits)
 
-        # ✅ val metrics 업데이트 (shape 일치)
+        # Update val metrics (shape-safe)
         self.val_acc_metric.update(Y_logits_slide.detach(), label_idx)
         self.val_bacc_metric.update(Y_logits_slide.detach(), label_idx)
 
@@ -335,7 +328,7 @@ class DTFDGradingTrainerModule(pl.LightningModule):
         )
 
     def on_validation_epoch_end(self):
-        # ✅ compute
+        # Compute
         val_acc = float(self.val_acc_metric.compute().item()) * 100.0
         val_bacc = float(self.val_bacc_metric.compute().item()) * 100.0
         val_qwk = float(self.val_qwk_metric.compute().item())  # 0~1
@@ -346,23 +339,23 @@ class DTFDGradingTrainerModule(pl.LightningModule):
         )
 
         # ==========================================================
-        # ✅✅ EarlyStopping/Checkpoint 모니터 키 "반드시" 로깅
+        # MUST log monitor keys for EarlyStopping/Checkpoint
         # ==========================================================
         self.log("QWK/val", val_qwk, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
         self.log("val_qwk", val_qwk, on_step=False, on_epoch=True, prog_bar=True,  logger=True, sync_dist=False)
 
-        # 참고용 로깅
+        # Additional reference logs
         self.log("ACC/val", val_acc, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
         self.log("ACC_balanced/val", val_bacc, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
         self.log("val_bacc", val_bacc, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
 
-        # reset
+        # Reset
         self.val_acc_metric.reset()
         self.val_bacc_metric.reset()
         self.val_qwk_metric.reset()
 
     # -----------------------------
-    # test
+    # Test
     # -----------------------------
     def on_test_epoch_start(self):
         self.test_outputs = []
@@ -395,7 +388,7 @@ class DTFDGradingTrainerModule(pl.LightningModule):
         else:
             loss0, loss1, Y_logits = self.forward(feats, label=target_label, train=False)
 
-        # ✅ test에서도 통일 (기존 로직과 동일하지만 함수로 정리)
+        # Unify logits and compute probs
         Y_logits_slide = self._to_slide_logits(Y_logits)
         Y_prob = F.softmax(Y_logits_slide, dim=1)
 
@@ -406,7 +399,7 @@ class DTFDGradingTrainerModule(pl.LightningModule):
 
         total_loss = loss0 + loss1
 
-        # ✅ test metrics 업데이트
+        # Update test metrics
         self.test_acc_metric.update(Y_logits_slide.detach(), label_idx)
         self.test_bacc_metric.update(Y_logits_slide.detach(), label_idx)
 
@@ -419,11 +412,12 @@ class DTFDGradingTrainerModule(pl.LightningModule):
 
         slide_name = name[0] if isinstance(name, (list, tuple)) else name
 
+        # Store for analysis callback
         self.test_outputs.append(
             {
                 "name": slide_name,
                 "coords": coords,
-                "probs": Y_prob.detach().cpu(),     # (1,C)
+                "probs": Y_prob.detach().cpu(),     # (1, C)
                 "label": label_idx.detach().cpu(),  # (1,)
                 "attn": attn_weights,
             }
@@ -438,7 +432,7 @@ class DTFDGradingTrainerModule(pl.LightningModule):
         test_qwk = float(self.test_qwk_metric.compute().item())
         test_ece = float(self.test_ece_metric.compute().item())
 
-        # ✅ Lightning 표에 뜨게 로깅
+        # Log so they appear in Lightning's table
         self.log("final_test/acc", test_acc, sync_dist=False)
         self.log("final_test/balanced_acc", test_bacc, sync_dist=False)
         self.log("final_test/qwk", test_qwk, sync_dist=False)
@@ -449,18 +443,18 @@ class DTFDGradingTrainerModule(pl.LightningModule):
             f"QWK={test_qwk:.4f} | BAcc={test_bacc*100:.2f}% | ACC={test_acc*100:.2f}% | ECE={test_ece:.4f}"
         )
 
-        # save_metrics 호환용
+        # For save_metrics compatibility
         self.logits = torch.cat(self.y_prob_list, dim=0).detach().cpu() if len(self.y_prob_list) else None
         self.labels = torch.cat(self.label_list, dim=0).detach().cpu() if len(self.label_list) else None
 
-        # reset
+        # Reset
         self.test_acc_metric.reset()
         self.test_bacc_metric.reset()
         self.test_qwk_metric.reset()
         self.test_ece_metric.reset()
 
     # -----------------------------
-    # optimizers / schedulers
+    # Optimizers / schedulers
     # -----------------------------
     def configure_optimizers(self):
         trainable_parameters = []

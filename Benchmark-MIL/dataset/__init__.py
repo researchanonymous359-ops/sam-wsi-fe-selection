@@ -11,7 +11,7 @@ def get_default_CLASS_LABELS():
     return ["0", "1"]
 
 
-# Seegene colon 계열 (3D / Leica) 7-class
+# Seegene colon family (3D / Leica) 7-class
 def get_seegene_7_class_LABELS():
     return ["HP", "IP", "LP", "SSL", "TA", "TSA", "TVA+VA"]
 
@@ -75,15 +75,15 @@ def get_cptac_ucec_3_class_LABELS():
 
 
 # ============================================================
-# 2. Dataset Name Normalization (🔥 핵심)
+# 2. Dataset Name Normalization (core)
 # ============================================================
 
 def _normalize_dataset_name(name: str) -> str:
     """
-    모든 dataset name을 다음 규칙으로 canonical name으로 변환
-    - 대소문자 무시
-    - '-' '_' 통일
-    - alias 허용
+    Convert any dataset name into a canonical name following the rules below:
+    - Case-insensitive
+    - Unify '-' and '_' (normalize to '-')
+    - Allow aliases
     """
     if name is None:
         return None
@@ -142,16 +142,16 @@ def _normalize_dataset_name(name: str) -> str:
         "cptac-ucec-grading": "cptac_ucec",
     }
 
-    # 1차: 정확 매칭
+    # 1st pass: exact match
     if key in CANONICAL_MAP:
         return CANONICAL_MAP[key]
 
-    # 2차: 포함 관계 (관대하게)
+    # 2nd pass: substring match (more permissive)
     for k, v in CANONICAL_MAP.items():
         if k in key:
             return v
 
-    # fallback: 원래 문자열 (최소한 crash는 방지)
+    # fallback: return the raw string (prevents crash at least)
     return raw
 
 
@@ -161,7 +161,7 @@ def _normalize_dataset_name(name: str) -> str:
 
 def get_class_names(dataset_name):
     if dataset_name is None:
-        print("Not specify dataset, use default dataset with label 0, 1 instead.")
+        print("Dataset not specified. Using default labels: 0, 1.")
         return get_default_CLASS_LABELS()
 
     canon = _normalize_dataset_name(dataset_name)

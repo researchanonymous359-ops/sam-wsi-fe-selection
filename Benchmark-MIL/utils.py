@@ -6,7 +6,7 @@ import numpy as np
 import yaml
 from pathlib import Path
 from PIL import Image
-import matplotlib.pyplot as plt
+import matplotlib.subplots as plt
 import matplotlib as mpl
 
 import torch
@@ -76,7 +76,7 @@ def get_cam_1d(classifier, features):
 
 
 def save_yaml(path, yaml_file:dict):
-    assert ('.yaml' in path) or ('.yml' in path), 'Error : yaml(yml) 파일이 아닌 파일을 저장하려고 합니다.'
+    assert ('.yaml' in path) or ('.yml' in path), 'Error: Attempting to save a file that is not a yaml(yml) file.'
     with open(fr'{path}', 'w') as p:
         yaml.dump(yaml_file, p)
 
@@ -110,7 +110,7 @@ def scale_entropy(entropies, args):
 
 def save_attention_map(slide_name, label_name, pred_name, coords, attention_map, patch_size, downsample, patch_path, save_path):
     """
-    Generates and saves attention map as an image.
+    Generates and saves an attention map as an image.
     Args:
         slide_name (str): Name of the slide.
         label_name (str): True label name.
